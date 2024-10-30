@@ -1,7 +1,7 @@
-*.i
-*.ii
-*.gpu
-*.ptx
-*.cubin
-*.fatbin
-__pycache__/
+__pycache__
+.idea
+.DS_Store
+*.egg-info
+build
+outputs
+dist/*

@@ -22,6 +22,17 @@ m.def("attention_inference_forward", attention_inference_forward);
 
 */
 
+
+#ifdef TK_COMPILE_TTT_MLP_FORWARD
+extern torch::Tensor ttt_mlp_forward(
+    const torch::Tensor x
+);
+#endif
+
+////////////////////////////////
+//// ThunderKittens Premade ////
+////////////////////////////////
+
 #ifdef TK_COMPILE_ATTN
 extern std::vector<torch::Tensor> attention_forward(
     torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
@@ -129,6 +140,10 @@ extern torch::Tensor mamba2(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "ThunderKittens Kernels"; // optional module docstring
+
+#ifdef TK_COMPILE_TTT_MLP_FORWARD
+    m.def("ttt_mlp_forward", &ttt_mlp_forward, "TTT-MLP Forward.");
+#endif
 
 #ifdef TK_COMPILE_ATTN
     m.def("mha_forward",  torch::wrap_pybind_function(attention_forward), "Bidirectional forward MHA. Takes Q,K,V,O in (B,H,N,D) where D must be 64 or 128, and N must be a multiple of 64. Additionally writes out norm vector L of shape (B,H,N), used in backward pass.");
