@@ -57,10 +57,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /code/kernels/ttt_mlp
+CMAKE_SOURCE_DIR = /code/kernels/ttt_linear
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /code/kernels/ttt_mlp
+CMAKE_BINARY_DIR = /code/kernels/ttt_linear
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /code/kernels/ttt_mlp/CMakeFiles /code/kernels/ttt_mlp//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /code/kernels/ttt_linear/CMakeFiles /code/kernels/ttt_linear//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /code/kernels/ttt_mlp/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /code/kernels/ttt_linear/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -117,41 +117,41 @@ depend:
 .PHONY : depend
 
 #=============================================================================
-# Target rules for targets named ttt_mlp_forward
+# Target rules for targets named ttt_linear_forward
 
 # Build rule for target.
-ttt_mlp_forward: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ttt_mlp_forward
-.PHONY : ttt_mlp_forward
+ttt_linear_forward: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 ttt_linear_forward
+.PHONY : ttt_linear_forward
 
 # fast build rule for target.
-ttt_mlp_forward/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_mlp_forward.dir/build.make CMakeFiles/ttt_mlp_forward.dir/build
-.PHONY : ttt_mlp_forward/fast
+ttt_linear_forward/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_linear_forward.dir/build.make CMakeFiles/ttt_linear_forward.dir/build
+.PHONY : ttt_linear_forward/fast
 
-ttt_mlp_forward.o: ttt_mlp_forward.cu.o
-.PHONY : ttt_mlp_forward.o
+ttt_linear_forward.o: ttt_linear_forward.cu.o
+.PHONY : ttt_linear_forward.o
 
 # target to build an object file
-ttt_mlp_forward.cu.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_mlp_forward.dir/build.make CMakeFiles/ttt_mlp_forward.dir/ttt_mlp_forward.cu.o
-.PHONY : ttt_mlp_forward.cu.o
+ttt_linear_forward.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_linear_forward.dir/build.make CMakeFiles/ttt_linear_forward.dir/ttt_linear_forward.cu.o
+.PHONY : ttt_linear_forward.cu.o
 
-ttt_mlp_forward.i: ttt_mlp_forward.cu.i
-.PHONY : ttt_mlp_forward.i
+ttt_linear_forward.i: ttt_linear_forward.cu.i
+.PHONY : ttt_linear_forward.i
 
 # target to preprocess a source file
-ttt_mlp_forward.cu.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_mlp_forward.dir/build.make CMakeFiles/ttt_mlp_forward.dir/ttt_mlp_forward.cu.i
-.PHONY : ttt_mlp_forward.cu.i
+ttt_linear_forward.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_linear_forward.dir/build.make CMakeFiles/ttt_linear_forward.dir/ttt_linear_forward.cu.i
+.PHONY : ttt_linear_forward.cu.i
 
-ttt_mlp_forward.s: ttt_mlp_forward.cu.s
-.PHONY : ttt_mlp_forward.s
+ttt_linear_forward.s: ttt_linear_forward.cu.s
+.PHONY : ttt_linear_forward.s
 
 # target to generate assembly for a file
-ttt_mlp_forward.cu.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_mlp_forward.dir/build.make CMakeFiles/ttt_mlp_forward.dir/ttt_mlp_forward.cu.s
-.PHONY : ttt_mlp_forward.cu.s
+ttt_linear_forward.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/ttt_linear_forward.dir/build.make CMakeFiles/ttt_linear_forward.dir/ttt_linear_forward.cu.s
+.PHONY : ttt_linear_forward.cu.s
 
 # Help Target
 help:
@@ -161,10 +161,10 @@ help:
 	@echo "... depend"
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
-	@echo "... ttt_mlp_forward"
-	@echo "... ttt_mlp_forward.o"
-	@echo "... ttt_mlp_forward.i"
-	@echo "... ttt_mlp_forward.s"
+	@echo "... ttt_linear_forward"
+	@echo "... ttt_linear_forward.o"
+	@echo "... ttt_linear_forward.i"
+	@echo "... ttt_linear_forward.s"
 .PHONY : help
 
 

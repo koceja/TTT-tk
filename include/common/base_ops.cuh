@@ -280,6 +280,26 @@ template<> __device__ inline bf16_2 div::op<bf16_2>(const bf16_2 &a, const bf16_
 template<> __device__ inline half   div::op<half>  (const half   &a, const half   &b) { return __hdiv(a, b);             }
 template<> __device__ inline half_2 div::op<half_2>(const half_2 &a, const half_2 &b) { return __h2div(a, b);            }
 /**
+ * @brief Square root operation.
+ *
+ * This operation calculates the quotient of two input values.
+ *
+ * @tparam T The data type of the input and output values.
+ * @param a[in] The first input value.
+ * @param b[in] The second input value.
+ * @return The quotient of the input values.
+ */
+struct sqrt {
+    template<typename T> static __device__ inline T op(const T &a) { return sqrt(a); }
+};
+// template<> __device__ inline float  sqrt::op<float> (const float &x ) { return __fsqrt_rn(x);                                  }
+template<> __device__ inline float2 sqrt::op<float2>(const float2 &x) { return float2{__fsqrt_rn(x.x), __fsqrt_rn(x.y)};         }
+template<> __device__ inline bf16   sqrt::op<bf16>  (const bf16 &x  ) { return hsqrt(x);    }
+template<> __device__ inline bf16_2 sqrt::op<bf16_2>(const bf16_2 &x) { return h2sqrt(x); }
+// @Xinhao: add half and half_2
+template<> __device__ inline half   sqrt::op<half>  (const half &x  ) { return hsqrt(x);    }
+template<> __device__ inline half_2 sqrt::op<half_2>(const half_2 &x) { return h2sqrt(x); }
+/**
  * @brief Maximum operation.
  *
  * This operation calculates the maximum of two input values.

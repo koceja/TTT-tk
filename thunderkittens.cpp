@@ -23,6 +23,14 @@ m.def("attention_inference_forward", attention_inference_forward);
 */
 
 
+
+#ifdef TK_COMPILE_TTT_MLP_FORWARD
+extern torch::Tensor ttt_linear_forward(
+    const torch::Tensor x
+);
+#endif
+
+
 #ifdef TK_COMPILE_TTT_MLP_FORWARD
 extern torch::Tensor ttt_mlp_forward(
     const torch::Tensor x
@@ -140,6 +148,10 @@ extern torch::Tensor mamba2(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "ThunderKittens Kernels"; // optional module docstring
+
+#ifdef TK_COMPILE_TTT_LINEAR_FORWARD
+    m.def("ttt_linear_forward", &ttt_linear_forward, "TTT-Linear Forward.");
+#endif
 
 #ifdef TK_COMPILE_TTT_MLP_FORWARD
     m.def("ttt_mlp_forward", &ttt_mlp_forward, "TTT-MLP Forward.");

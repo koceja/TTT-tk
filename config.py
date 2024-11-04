@@ -1,5 +1,10 @@
 ### ADD TO THIS TO REGISTER NEW KERNELS
 sources = {
+    'ttt_linear_forward': {
+        'source_files': {
+            'h100': 'kernels/ttt_linear/ttt_linear_forward.cu'
+        }
+    },
     'ttt_mlp_forward': {
         'source_files': {
             'h100': 'kernels/ttt_mlp/ttt_mlp_forward.cu'
@@ -59,7 +64,7 @@ sources = {
 
 ### WHICH KERNELS DO WE WANT TO BUILD?
 # (oftentimes during development work you don't need to redefine them all.)
-kernels = ['ttt_mlp_forward']
+kernels = ['ttt_linear_forward', 'ttt_mlp_forward']
 
 ### WHICH GPU TARGET DO WE WANT TO BUILD FOR?
 target = 'h100'

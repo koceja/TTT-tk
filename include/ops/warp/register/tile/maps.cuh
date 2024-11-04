@@ -422,6 +422,19 @@ template<ducks::rt::all T>
 __device__ static inline void exp(T &dst, const T &src) {
     unary_map<base_ops::exp, T>(dst, src);
 }
+
+/**
+ * @brief Applies the sqrt function to each element of a tile.
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile to apply the exponential function on.
+ */
+template<ducks::rt::all T>
+__device__ static inline void sqrt(T &dst, const T &src) {
+    unary_map<base_ops::sqrt, T>(dst, src);
+}
+
 /**
  * @brief Applies the exponential function to each element of a tile, in base 2.
  *
