@@ -50,7 +50,7 @@ __device__ static inline void LN_fwd_fp16(
 
     rt_fl<16, F>::col_vec Z1_mean_reg;
     row_sum(Z1_mean_reg, Z1_reg);
-    div(Z1_mean_reg, Z1_mean_reg, __float2half(float(HF)));
+    div(Z1_mean_reg, Z1_mean_reg, float(HF));
 
     rt_fl<16, F> Z1_square_reg;
     sub_row(Z1_square_reg, Z1_reg, Z1_mean_reg);
@@ -58,8 +58,8 @@ __device__ static inline void LN_fwd_fp16(
 
     rt_fl<16, F>::col_vec Z1_std_reg;
     row_sum(Z1_std_reg, Z1_square_reg);
-    div(Z1_std_reg, Z1_std_reg, __float2half(float(HF)));
-    add(Z1_std_reg, Z1_std_reg, __float2half(1e-6f));
+    div(Z1_std_reg, Z1_std_reg, float(HF));
+    add(Z1_std_reg, Z1_std_reg, 1e-6f);
     sqrt(Z1_std_reg, Z1_std_reg);
 
     // Z1_hat = (Z - mu) / std
@@ -83,7 +83,7 @@ __device__ static inline void ln_fused_l2_bwd_fp16(
 ){
     rt_fl<16, F>::col_vec Z1_mean_reg;
     row_sum(Z1_mean_reg, Z1_reg);
-    div(Z1_mean_reg, Z1_mean_reg, __float2half(float(HF)));
+    div(Z1_mean_reg, Z1_mean_reg, float(HF));
 
     rt_fl<16, F> Z1_square_reg;
     sub_row(Z1_square_reg, Z1_reg, Z1_mean_reg);
@@ -91,8 +91,8 @@ __device__ static inline void ln_fused_l2_bwd_fp16(
 
     rt_fl<16, F>::col_vec Z1_std_reg;
     row_sum(Z1_std_reg, Z1_square_reg);
-    div(Z1_std_reg, Z1_std_reg, __float2half(float(HF)));
-    add(Z1_std_reg, Z1_std_reg, __float2half(1e-6f));
+    div(Z1_std_reg, Z1_std_reg, float(HF));
+    add(Z1_std_reg, Z1_std_reg, 1e-6f);
     sqrt(Z1_std_reg, Z1_std_reg);
 
     // Z1_hat = (Z - mu) / std
@@ -118,7 +118,7 @@ __device__ static inline void ln_fused_l2_bwd_fp16(
     //           ) / (std * HF)
 
     // HF * dl_dZ1_hat
-    mul(dl_dZ1, dl_dZ1_hat, __float2half(float(HF)));
+    mul(dl_dZ1, dl_dZ1_hat, float(HF));
 
     // HF * dl_dZ1_hat - dl_dZ1_hat.sum(dim=-1, keepdim=True)
     rt_fl<16, F>::col_vec dl_dZ1_vec_term;
@@ -132,7 +132,7 @@ __device__ static inline void ln_fused_l2_bwd_fp16(
     mul_row(dl_dZ1_term_3, Z1_hat, dl_dZ1_vec_term);
 
     sub(dl_dZ1, dl_dZ1, dl_dZ1_term_3);
-    mul(Z1_std_reg, Z1_std_reg, __float2half(float(HF)));
+    mul(Z1_std_reg, Z1_std_reg, float(HF));
     div_row(dl_dZ1, dl_dZ1, Z1_std_reg);
 
 }
@@ -392,7 +392,7 @@ __global__ void ttt_linear_forward_kernel(
         rt_fl<16, 16> eta_reg;
         load(eta_reg, Eta_smem[0]);
         rt_fl<16, 16> Attn1_reg;
-        make_causal(eta_reg, eta_reg, base_types::constants<half>::zero());
+        make_causal(eta_reg, eta_reg, base_types::constants<float>::zero());
         // mma_AB(delta_b1_init, eta_reg, dl_dZ1_col, delta_b1_init);
         matmul(delta_b1_init, eta_reg, dl_dZ1_col, delta_b1_init);
         sub(b1_init, b1_init, delta_b1_init);
@@ -405,7 +405,7 @@ __global__ void ttt_linear_forward_kernel(
         matmul_trans(Attn1_reg, XQ_reg, XK_reg, Attn1_reg);
         // mma_ABt(Attn1_reg, XQ_reg, XK_reg, Attn1_reg);
 
-        make_causal(Attn1_reg, Attn1_reg, base_types::constants<half>::zero());
+        make_causal(Attn1_reg, Attn1_reg, base_types::constants<float>::zero());
         mul(Attn1_reg, eta_reg, Attn1_reg);
 
         rt_fl<16, F> Z1_bar_term_1_reg;
