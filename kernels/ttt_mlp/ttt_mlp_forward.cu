@@ -496,12 +496,25 @@ torch::Tensor ttt_mlp_forward(
     const torch::Tensor XQ_batch,
     const torch::Tensor XV_batch,
     const torch::Tensor XK_batch,
-    const torch::Tensor eta_batch,
+    const torch::Tensor eta_batch
 )
 {
-    do_nothing_kernel<<<1, 1>>>();
+    ttt_mlp_forward_kernel<B, NH, NC, CS, F><<<B * NH, kittens::WARP_THREADS>>>(
+        W1_init.data_ptr<float>(),
+        b1_init.data_ptr<float>(),
+        W2_init.data_ptr<float>(),
+        b2_init.data_ptr<float>(),
+        XQ_batch.data_ptr<float>(),
+        XV_batch.data_ptr<float>(),
+        XK_batch.data_ptr<float>(),
+        eta_batch.data_ptr<float>(),
+        ttt_norm_weight.data_ptr<float>(),
+        ttt_norm_bias.data_ptr<float>(),
+        // NH, NC, CS, F, F*4
+    );
 
-    return torch::ones({2, 3}, torch::TensorOptions().device(torch::kCUDA));
+    // FIXME: return the ACTUAL output from the kernel
+    return XQ_batch;
 }
 #endif
 

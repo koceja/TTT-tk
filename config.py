@@ -64,7 +64,7 @@ sources = {
 
 ### WHICH KERNELS DO WE WANT TO BUILD?
 # (oftentimes during development work you don't need to redefine them all.)
-kernels = ['ttt_linear_forward', 'ttt_mlp_forward']
+kernels = ['ttt_linear_forward']
 
 ### WHICH GPU TARGET DO WE WANT TO BUILD FOR?
 target = 'h100'

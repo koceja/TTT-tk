@@ -655,15 +655,41 @@ torch::Tensor ttt_linear_forward(
     const torch::Tensor XV_batch,
     const torch::Tensor XK_batch,
     const torch::Tensor eta_batch,
+    const torch::Tensor make_last_b_matrix,
+    const torch::Tensor make_last_coeff_1_matrix,
+    const torch::Tensor output
 )
 {
-    do_nothing_kernel<<<1, 1>>>();
+    gl<float, 1, B*NH, F, F> W1_init_gl{W1_init.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, 1, B*NH, 1, F> b1_init_gl{b1_init.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, B*NH, NC, CS, F> XQ_batch_gl{XQ_batch.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, B*NH, NC, CS, F> XV_batch_gl{XV_batch.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, B*NH, NC, CS, F> XK_batch_gl{XK_batch.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, B*NH, NC, CS, F> eta_batch_gl{eta_batch.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, 1, 1, NH, F> ttt_norm_weight_gl{ttt_norm_weight.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, 1, 1, NH, F> ttt_norm_bias_gl{ttt_norm_bias.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, 1, 1, CS, CS> make_last_b_matrix_gl{make_last_b_matrix.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, 1, 1, CS, F> make_last_coeff_1_matrix_gl{make_last_coeff_1_matrix.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
+    gl<float, B*NH, NC, CS, F> output_gl{output.data_ptr<float>(), nullptr, nullptr, nullptr, nullptr};
 
-    return torch::ones({2, 3}, torch::TensorOptions().device(torch::kCUDA));
+    ttt_linear_forward_kernel<<<B * NH, kittens::WARP_THREADS, 49152>>>(
+        W1_init_gl,
+        b1_init_gl,
+        XQ_batch_gl,
+        XV_batch_gl,
+        XK_batch_gl,
+        eta_batch_gl,
+        ttt_norm_weight_gl,
+        ttt_norm_bias_gl,
+        make_last_b_matrix_gl,
+        make_last_coeff_1_matrix_gl,
+        output_gl
+    );
+
+    // FIXME: return the ACTUAL output from the kernel
+    return XQ_batch;
 }
 #endif
-
-
 
 int main()
 {

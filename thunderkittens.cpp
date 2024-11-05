@@ -24,16 +24,35 @@ m.def("attention_inference_forward", attention_inference_forward);
 
 
 
-#ifdef TK_COMPILE_TTT_MLP_FORWARD
+#ifdef TK_COMPILE_TTT_LINEAR_FORWARD
 extern torch::Tensor ttt_linear_forward(
-    const torch::Tensor x
+    const torch::Tensor ttt_norm_weight,
+    const torch::Tensor ttt_norm_bias,
+    const torch::Tensor W1_init,
+    const torch::Tensor b1_init,
+    const torch::Tensor XQ_batch,
+    const torch::Tensor XV_batch,
+    const torch::Tensor XK_batch,
+    const torch::Tensor eta_batch,
+    const torch::Tensor make_last_b_matrix,
+    const torch::Tensor make_last_coeff_1_matrix,
+    const torch::Tensor output
 );
 #endif
 
 
 #ifdef TK_COMPILE_TTT_MLP_FORWARD
 extern torch::Tensor ttt_mlp_forward(
-    const torch::Tensor x
+    const torch::Tensor ttt_norm_weight,
+    const torch::Tensor ttt_norm_bias,
+    const torch::Tensor W1_init,
+    const torch::Tensor b1_init,
+    const torch::Tensor W2_init,
+    const torch::Tensor b2_init,
+    const torch::Tensor XQ_batch,
+    const torch::Tensor XV_batch,
+    const torch::Tensor XK_batch,
+    const torch::Tensor eta_batch
 );
 #endif
 
