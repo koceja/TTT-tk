@@ -5,6 +5,7 @@
 // #include <c10/util/BFloat16.h>
 
 #define ASSERT(cond) if (!(cond)) { printf("Assertion failed: %s\n", #cond); return 1; }
+#define CUDA_ASSERT(cond, tidx) if (!(cond)) { if (tidx == -1 || threadIdx.x == tidx) printf("Kernel assert failed: %s\n", #cond); return; }
 #define STATIC_PRINT(num) template <int> struct static_print; static_assert(static_print<num>::x, "");
 
 using namespace kittens;
@@ -30,8 +31,9 @@ __global__ void ttt_tp_forward_ker(
     int h = blockIdx.z;
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     int tp = cluster.block_rank();
+    CUDA_ASSERT(tp == blockIdx.x, 0);
 
-    extern __shared__ int __shm[(N*F+F*F*K/TP+F*K/TP*N+F*K/TP*F+F*N)*sizeof(bf16)/sizeof(int)]; 
+    extern __shared__ int __shm[(N*F+F*F*K/TP+F*K/TP*N+F*K/TP*F+F*N+F*N)*sizeof(bf16)/sizeof(int)];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
     st_bf<N, F> &XK = al.allocate<typeof(XK)>();
@@ -41,22 +43,62 @@ __global__ void ttt_tp_forward_ker(
     st_bf<F*K/TP, F> &W2 = al.allocate<typeof(W2)>();
     rt_fl<F/G, N> Z2_reg;
     st_bf<F, N> &Z2 = al.allocate<typeof(Z2)>();
+    st_bf<F, N> &Z2_other = al.allocate<typeof(Z2_other)>();
 
-    static_assert(sizeof(XK)+sizeof(W1)+sizeof(X2)+sizeof(W2)+sizeof(Z2) == sizeof(__shm), "Incorrect shared memory allocation");
+    static_assert(sizeof(XK)+sizeof(W1)+sizeof(X2)+sizeof(W2)+sizeof(Z2)+sizeof(Z2_other) == sizeof(__shm), "Incorrect shared memory allocation");
 
     wg::load(XK, XK_gl, {b, h, 0, 0});
-    wg::load(W1, W1_gl, {b, h, 0, tp * F*K/TP});
+    wg::load(W1, W1_gl, {b, h, 0, tp});
     wg::mm_AtBt(Z1_reg, W1, XK);
     wg::mma_commit_group(); // might be able to remove this line
     wg::mma_async_wait();
     wg::store(X2, Z1_reg);
     
-    wg::load(W2, W2_gl, {b, h, tp * F*K/TP, 0});
+    wg::load(W2, W2_gl, {b, h, tp, 0});
     wg::mm_AtB(Z2_reg, W2, X2);
     wg::mma_commit_group();
     wg::mma_async_wait();
     wg::store(Z2, Z2_reg);
 
+    // Square All-Reduce! :D
+    __shared__ semaphore dsmem_semaphore[2];
+    if (wg::warpid() == 0) {
+        init_semaphore(dsmem_semaphore[0], 0, 1);
+        tma::expect_bytes(dsmem_semaphore[0], sizeof(Z2_other));
+    }
+    tma::cluster::sync();
+    if (wg::warpid() == 0) {
+        tma::cluster::store_async(Z2_other, Z2, tp ^ 1, dsmem_semaphore[0]);
+        wait(dsmem_semaphore[0], 0);
+    }
+    wg::sync(1); // hold other threads here
+    wg::add(Z2, Z2, Z2_other);
+
+    if (wg::warpid() == 0) {
+        init_semaphore(dsmem_semaphore[1], 0, 1);
+        tma::expect_bytes(dsmem_semaphore[1], sizeof(Z2_other));
+    }
+    tma::cluster::sync();
+    if (wg::warpid() == 0) {
+        tma::cluster::store_async(Z2_other, Z2, tp ^ 2, dsmem_semaphore[1]);
+        wait(dsmem_semaphore[1], 0);
+    }
+    wg::sync(1);
+    wg::add(Z2, Z2, Z2_other);
+
+    if (tp == 0 && wg::laneid() == 0)
+        printf("After All-Reduce:\n");
+    for (int g = 0; g < G; g++) {
+        if (tp == g and wg::laneid() == 0) {
+            printf("TP %d: ", tp);
+            for (int i = 0; i < 10; i++) {
+                printf("%f ", __bfloat162float(Z2[i]));
+            }
+            printf("\n");
+        }
+        tma::cluster::sync();
+    }
+    
     *signal = true;
 }
 
