@@ -56,6 +56,18 @@ extern torch::Tensor ttt_mlp_forward(
 );
 #endif
 
+#ifdef TK_COMPILE_TTT_TP
+extern torch::Tensor ttt_tp_forward(
+    const torch::Tensor XQ,
+    const torch::Tensor XK,
+    const torch::Tensor XV,
+    const torch::Tensor W1,
+    const torch::Tensor W2,
+    const torch::Tensor out
+);
+#endif
+
+
 ////////////////////////////////
 //// ThunderKittens Premade ////
 ////////////////////////////////
@@ -174,6 +186,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 #ifdef TK_COMPILE_TTT_MLP_FORWARD
     m.def("ttt_mlp_forward", &ttt_mlp_forward, "TTT-MLP Forward.");
+#endif
+
+#ifdef TK_COMPILE_TTT_TP
+    m.def("ttt_tp_forward", &ttt_tp_forward, "TTT-TP Forward.");
 #endif
 
 #ifdef TK_COMPILE_ATTN
