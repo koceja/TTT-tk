@@ -231,7 +231,6 @@
     /usr/include/c++/11/bits/stl_vector.h \
     /usr/include/c++/11/bits/stl_bvector.h \
     /usr/include/c++/11/bits/vector.tcc \
-    /usr/local/cuda-12.6/bin/../targets/x86_64-linux/include/math_constants.h \
     /usr/local/cuda-12.6/bin/../targets/x86_64-linux/include/cooperative_groups.h \
     /usr/local/cuda-12.6/bin/../targets/x86_64-linux/include/cooperative_groups/details/info.h \
     /usr/local/cuda-12.6/bin/../targets/x86_64-linux/include/nv/target \
@@ -780,4 +779,5 @@
     /code/include/ops/group/shared/vec/vec.cuh \
     /code/include/ops/group/shared/vec/conversions.cuh \
     /code/include/ops/group/shared/vec/maps.cuh \
-    /code/include/ops/group/wgmma/wgmma.cuh
+    /code/include/ops/group/wgmma/wgmma.cuh \
+    /usr/local/cuda-12.6/bin/../targets/x86_64-linux/include/math_constants.h

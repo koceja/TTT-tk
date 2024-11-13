@@ -1,14 +1,17 @@
 #include "cooperative_groups.h"
 #include "kittens.cuh"
-#include <torch/torch.h>
+// #include <torch/torch.h>
 #include <math_constants.h>
-#include <c10/util/BFloat16.h>
+// #include <c10/util/BFloat16.h>
 
 #define ASSERT(cond) if (!(cond)) { printf("Assertion failed: %s\n", #cond); return 1; }
+#define STATIC_PRINT(num) template <int> struct static_print; static_assert(static_print<num>::x, "");
 
 using namespace kittens;
+using wg = kittens::warpgroup;
 
-constexpr int NUM_WORKERS = 4; // TODO: why is one warpgroup optimal?
+constexpr int G = WARPGROUP_WARPS;
+constexpr int NUM_WORKERS = G; // TODO: why is one warpgroup optimal?
 
 template<int B=1, int H=1, int N=16, int F=64, int K=4, int TP=4>
 __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
@@ -27,40 +30,37 @@ __global__ void ttt_tp_forward_ker(
     int h = blockIdx.z;
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     int tp = cluster.block_rank();
-    
-    rt_bf<N, F, ducks::rt_layout::row> XK;
-    rt_bf<F, F*K/TP, ducks::rt_layout::col> W1;
-    rt_fl<N, F*K/TP, ducks::rt_layout::row> Z1;
-    rt_bf<N, F*K/TP, ducks::rt_layout::row> X2;
-    rt_bf<F*K/TP, F, ducks::rt_layout::col> W2;
-    rt_fl<N, F, ducks::rt_layout::row> out;
-    st_fl<N, F> out_part;
-    
-    load(XK, XK_gl, {b, h, 0, 0});
-    load(W1, W1_gl, {b, h, 0, tp*(F*K/TP)});
-    zero(Z1);
-    mma_AB(Z1, XK, W1, Z1);
-    copy(X2, Z1); //dtype conversion
-    mma_AB(out, X2, W2, out);
-    
-    // store(out_part, out);
-    for (int i = 0; i < N*F; i+=blockDim.x)
-        out_part[i + threadIdx.x] = tp;
 
-    extern __shared__ KITTENS_DEFAULT_ALIGN float shm[N * F];
-    float *dsmem = cluster.map_shared_rank(&shm[0], 0);
-        for (int i = 0; i < N*F; i+=blockDim.x)
-            atomicAdd(&dsmem[i + threadIdx.x], out_part[i + threadIdx.x]);
-    cluster.sync();
+    extern __shared__ int __shm[(N*F+F*F*K/TP+F*K/TP*N+F*K/TP*F+F*N)*sizeof(bf16)/sizeof(int)]; 
+    tma_swizzle_allocator al((int*)&__shm[0]);
 
-    if (tp == 0 && threadIdx.x == 0)
-        for (int i = 0; i < N*F; i++)
-            printf("%.1f ", shm[i]);
-    cluster.sync();
+    st_bf<N, F> &XK = al.allocate<typeof(XK)>();
+    st_bf<F, F*K/TP> &W1 = al.allocate<typeof(W1)>();
+    rt_fl<F*K/TP/G, N> Z1_reg;
+    st_bf<F*K/TP, N> &X2 = al.allocate<typeof(X2)>();
+    st_bf<F*K/TP, F> &W2 = al.allocate<typeof(W2)>();
+    rt_fl<F/G, N> Z2_reg;
+    st_bf<F, N> &Z2 = al.allocate<typeof(Z2)>();
+
+    static_assert(sizeof(XK)+sizeof(W1)+sizeof(X2)+sizeof(W2)+sizeof(Z2) == sizeof(__shm), "Incorrect shared memory allocation");
+
+    wg::load(XK, XK_gl, {b, h, 0, 0});
+    wg::load(W1, W1_gl, {b, h, 0, tp * F*K/TP});
+    wg::mm_AtBt(Z1_reg, W1, XK);
+    wg::mma_commit_group(); // might be able to remove this line
+    wg::mma_async_wait();
+    wg::store(X2, Z1_reg);
+    
+    wg::load(W2, W2_gl, {b, h, tp * F*K/TP, 0});
+    wg::mm_AtB(Z2_reg, W2, X2);
+    wg::mma_commit_group();
+    wg::mma_async_wait();
+    wg::store(Z2, Z2_reg);
 
     *signal = true;
 }
 
+/*
 extern torch::Tensor ttt_tp_forward(
     const torch::Tensor XQ,
     const torch::Tensor XK,
