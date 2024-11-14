@@ -122,7 +122,7 @@ __global__ void ttt_tp_forward_ker(
         rt_fl<F/G, N> Z2_reg;
 
         for (int i = 0; i < NC; i++) {
-            wait(k_sem, 0);
+            wait(k_sem, i%2);
             if (i == 0) wait(w1_sem, 0);
             wg::mm_AtBt(Z1_reg, W1, XK);
             wg::mma_commit_group(); // might be able to remove this line
@@ -185,7 +185,7 @@ extern torch::Tensor ttt_tp_forward(
 }//*/
 
 int main() {
-    constexpr int B = 8, H = 32, NC = 16, N = 16, F = 64, K = 4, TP = 4;
+    constexpr int B = 8, H = 32, NC = 2048, N = 16, F = 64, K = 4, TP = 4;
 
     bf16 *h_XQ, *h_XK, *h_XV, *h_W1, *h_W2, *h_out;
 
