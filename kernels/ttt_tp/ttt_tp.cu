@@ -107,7 +107,7 @@ __global__ void ttt_tp_forward_ker(
     __syncthreads();
 
     if (wg::groupid() == CONSUMER_WARPGROUPS) {
-        warpgroup::decrease_registers<32>(); //TODO: TUNE
+        wg::producer_registers();
         tma::cluster::arrive_aligned();
         wait(minibatch_first_reduction_done, 0);
         tma::cluster::arrive_aligned();
@@ -129,7 +129,7 @@ __global__ void ttt_tp_forward_ker(
         }
         wait(minibatch_done, NC%2);
     } else {
-        warpgroup::increase_registers<32>(); //TODO: TUNE
+        wg::consumer_registers<CONSUMER_WARPGROUPS>();
         rt_fl<F*K/TP/G, N> Z1_reg;
         rt_fl<F*K/TP/G, N> Z1_bar_reg;
         rt_fl<F/G, N> Z2_reg;
