@@ -16,8 +16,16 @@ constexpr int PRODUCER_WARPGROUPS = 1;
 constexpr int CONSUMER_WARPGROUPS = 1;
 constexpr int NUM_WORKERS = (PRODUCER_WARPGROUPS+CONSUMER_WARPGROUPS)*G;
 
+template<int TP, ducks::st::all ST>
+__device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp);
+
+template<int TP, ducks::st::all ST>
+__device__ __forceinline__ void square_all_reduce<1, ST>(ST &tile, ST &tile_other, int tp) {
+    tma::cluster::arrive_aligned();
+}
+
 template<ducks::st::all ST>
-__device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp) {
+__device__ __forceinline__ void square_all_reduce<4, ST>(ST &tile, ST &tile_other, int tp) {
     __shared__ semaphore dsmem_semaphore[2];
     
     if (wg::warpid() == 0) {
@@ -99,7 +107,7 @@ __global__ void ttt_tp_forward_ker(
     __syncthreads();
 
     if (wg::groupid() == CONSUMER_WARPGROUPS) {
-        // warpgroup::decrease_registers<32>(); //TODO: TUNE
+        warpgroup::decrease_registers<32>(); //TODO: TUNE
         tma::cluster::arrive_aligned();
         wait(minibatch_first_reduction_done, 0);
         tma::cluster::arrive_aligned();
@@ -121,7 +129,7 @@ __global__ void ttt_tp_forward_ker(
         }
         wait(minibatch_done, NC%2);
     } else {
-        // warpgroup::increase_registers<32>();
+        warpgroup::increase_registers<32>(); //TODO: TUNE
         rt_fl<F*K/TP/G, N> Z1_reg;
         rt_fl<F*K/TP/G, N> Z1_bar_reg;
         rt_fl<F/G, N> Z2_reg;
@@ -144,11 +152,7 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_async_wait();
             wg::store(Z2, Z2_reg);
 
-            static_assert(TP == 4 || TP == 1, "TP must be 4 to use square_all_reduce, or 1 to disable");
-            if constexpr (TP == 4) // TODO(arjun): move to template specialization
-                square_all_reduce(Z2, reduction_buffer, tp);
-            else if constexpr (TP == 1)
-                tma::cluster::arrive_aligned();
+            square_all_reduce<TP>(Z2, reduction_buffer, tp);
 
             if (wg::laneid() == 0) arrive(minibatch_first_reduction_done, 1);
 
@@ -182,10 +186,7 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_async_wait();
 
             wg::store(Z2_bar, Z2_bar_reg);
-            if constexpr (TP == 4)
-                square_all_reduce(Z2_bar, reduction_buffer, tp);
-            else if constexpr (TP == 1)
-                tma::cluster::arrive_aligned();
+            square_all_reduce<TP>(Z2_bar, reduction_buffer, tp);
 
             if (wg::laneid() == 0) arrive(minibatch_done, 1);
         }
