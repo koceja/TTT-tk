@@ -61,24 +61,29 @@ __global__ void ttt_tp_forward_ker(
     // Define shared memory tiles
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int*)&__shm[0]);
+    st_bf<F, F*K/TP> &W1 = al.allocate<typeof(W1)>();
+    st_bf<F*K/TP, F> &W2 = al.allocate<typeof(W2)>();
     st_bf<N, F> &XQ = al.allocate<typeof(XQ)>();
     st_bf<N, F> &XK = al.allocate<typeof(XK)>();
     st_bf<N, F> &XV = al.allocate<typeof(XV)>();
-    st_bf<F, F*K/TP> &W1 = al.allocate<typeof(W1)>();
-    st_bf<F*K/TP, N> &X2 = al.allocate<typeof(X2)>();
-    st_bf<F*K/TP, F> &W2 = al.allocate<typeof(W2)>();
+    st_bf<F*K/TP, N> &Z1 = al.allocate<typeof(Z1)>();
     st_bf<F, N> &Z2 = al.allocate<typeof(Z2)>();
-    st_bf<F, N> &Z2_reduce_other = al.allocate<typeof(Z2_reduce_other)>();
+    st_bf<F, N> &reduction_buffer = al.allocate<typeof(reduction_buffer)>();
+    st_bf<F, N> &grad_l_wrt_Z2 = Z2;
+    st_bf<N, F*K/TP> &grad_l_wrt_Z1 = al.allocate<typeof(grad_l_wrt_Z1)>();
+    st_bf<F*K/TP, N> &Z1_bar = al.allocate<typeof(Z1_bar)>();
+    st_bf<F*K/TP, N> &Z2_bar = al.allocate<typeof(Z2_bar)>();
 
-    static_assert(sizeof(XQ)+sizeof(XK)+sizeof(XV)+sizeof(W1)+sizeof(X2)+sizeof(W2)+sizeof(Z2)+sizeof(Z2_reduce_other) <= MAX_SHARED_MEMORY-8192, "Incorrect shared memory allocation");
+    static_assert(sizeof(XQ)+sizeof(XK)+sizeof(XV)+sizeof(W1)+sizeof(Z1)+sizeof(W2)+sizeof(Z2)+sizeof(reduction_buffer)+sizeof(grad_l_wrt_Z1)+sizeof(Z1_bar)+sizeof(Z2_bar) <= MAX_SHARED_MEMORY-8192, "Incorrect shared memory allocation");
 
-    __shared__ semaphore w1_sem, w2_sem, q_sem, k_sem, v_sem, minibatch_done;
+    __shared__ semaphore w1_sem, w2_sem, q_sem, k_sem, v_sem, minibatch_first_reduction_done, minibatch_done;
     if (wg::groupid() == 0 && wg::warpid() == 0) {
         init_semaphore(w1_sem, 0, 1);
         init_semaphore(w2_sem, 0, 1);
         init_semaphore(q_sem, 0, 1);
         init_semaphore(k_sem, 0, 1);
         init_semaphore(v_sem, 0, 1);
+        init_semaphore(minibatch_first_reduction_done, CONSUMER_WARPGROUPS, 0);
         init_semaphore(minibatch_done, CONSUMER_WARPGROUPS, 0);
         tma::expect_bytes(w1_sem, sizeof(W1));
         tma::load_async(W1, W1_gl, {b, h, 0, tp}, w1_sem);
@@ -96,25 +101,34 @@ __global__ void ttt_tp_forward_ker(
     if (wg::groupid() == CONSUMER_WARPGROUPS) {
         // warpgroup::decrease_registers<32>(); //TODO: TUNE
         tma::cluster::arrive_aligned();
+        wait(minibatch_first_reduction_done, 0);
+        tma::cluster::arrive_aligned();
 
         for (int i = 1; i < NC; i++) {
-            wait(minibatch_done, (i+1)%2); // TODO: Why can't this be run only on Warp 0?
+            wait(minibatch_done, (i+1)%2);
             if (wg::warpid() == 0) {
                 tma::expect_bytes(k_sem, sizeof(XK));
                 tma::load_async(XK, XK_gl, {b, h, i, 0}, k_sem);
-                tma::expect_bytes(v_sem, sizeof(XV));
-                tma::load_async(XV, XV_gl, {b, h, i, 0}, v_sem);
                 tma::expect_bytes(q_sem, sizeof(XQ));
                 tma::load_async(XQ, XQ_gl, {b, h, i, 0}, q_sem);
+                tma::expect_bytes(v_sem, sizeof(XV));
+                tma::load_async(XV, XV_gl, {b, h, i, 0}, v_sem);
             }
             wg::sync(1);
+            tma::cluster::arrive_aligned();
+            wait(minibatch_first_reduction_done, i%2);
             tma::cluster::arrive_aligned();
         }
         wait(minibatch_done, NC%2);
     } else {
         // warpgroup::increase_registers<32>();
         rt_fl<F*K/TP/G, N> Z1_reg;
+        rt_fl<F*K/TP/G, N> Z1_bar_reg;
         rt_fl<F/G, N> Z2_reg;
+        rt_fl<F/G, N> Z2_bar_reg;
+        rt_fl<N/G, N> Attn_reg;
+        rt_bf<N/G, N> Attn_bf_reg;
+        rt_fl<N/G, F> grad_l_wrt_Z1_reg;
 
         for (int i = 0; i < NC; i++) {
             wait(k_sem, i%2);
@@ -122,14 +136,56 @@ __global__ void ttt_tp_forward_ker(
             wg::mm_AtBt(Z1_reg, W1, XK);
             wg::mma_commit_group(); // might be able to remove this line
             wg::mma_async_wait();
-            wg::store(X2, Z1_reg);
+            wg::store(Z1, Z1_reg);
 
             if (i == 0) wait(w2_sem, 0);
-            wg::mm_AtB(Z2_reg, W2, X2);
+            wg::mm_AtB(Z2_reg, W2, Z1);
             wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(Z2, Z2_reg);
-            square_all_reduce(Z2, Z2_reduce_other, tp);
+
+            static_assert(TP == 4 || TP == 1, "TP must be 4 to use square_all_reduce, or 1 to disable");
+            if constexpr (TP == 4) // TODO(arjun): move to template specialization
+                square_all_reduce(Z2, reduction_buffer, tp);
+            else if constexpr (TP == 1)
+                tma::cluster::arrive_aligned();
+
+            if (wg::laneid() == 0) arrive(minibatch_first_reduction_done, 1);
+
+            // Maybe V should come first?
+            wait(q_sem, i%2);
+            wg::mm_ABt(Attn_reg, XQ, XK); //Attn1
+            wg::mm_AtBt(Z1_bar_reg, W1, XQ);
+            wg::mma_commit_group();
+
+            wait(v_sem, i%2);
+            wg::sub(grad_l_wrt_Z2, Z2, XV); // reverse order to get negated gradient
+            wg::mm_AtBt(grad_l_wrt_Z1_reg, grad_l_wrt_Z2, W2); // negated gradient
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+
+            wg::store(grad_l_wrt_Z1, grad_l_wrt_Z1_reg);
+            copy(Attn_bf_reg, Attn_reg);
+            wg::mma_AB(Z1_bar_reg, Attn_bf_reg, grad_l_wrt_Z1); // try: could instead use grad_l_wrt_Z1 from register (with copy to convert dtype first)
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+
+            wg::store(Z1_bar, Z1_bar_reg);
+            wg::mm_AtB(Attn_reg, Z1_bar, Z1);
+            wg::mm_ABt(Z2_bar_reg, W2, Z1_bar);
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+
+            copy(Attn_bf_reg, Attn_reg);
+            wg::mma_AB(Z2_bar_reg, Attn_bf_reg, grad_l_wrt_Z2);
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+
+            wg::store(Z2_bar, Z2_bar_reg);
+            if constexpr (TP == 4)
+                square_all_reduce(Z2_bar, reduction_buffer, tp);
+            else if constexpr (TP == 1)
+                tma::cluster::arrive_aligned();
 
             if (wg::laneid() == 0) arrive(minibatch_done, 1);
         }
@@ -180,7 +236,7 @@ extern torch::Tensor ttt_tp_forward(
 }//*/
 
 int main() {
-    constexpr int B = 8, H = 32, NC = 512, N = 64, F = 64, K = 4, TP = 4;
+    constexpr int B = 8, H = 32, NC = 128, N = 64, F = 64, K = 4, TP = 4;
 
     bf16 *h_XQ, *h_XK, *h_XV, *h_W1, *h_W2, *h_out;
 
