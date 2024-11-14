@@ -5,100 +5,142 @@
 // #include <c10/util/BFloat16.h>
 
 #define ASSERT(cond) if (!(cond)) { printf("Assertion failed: %s\n", #cond); return 1; }
-#define CUDA_ASSERT(cond, tidx) if (!(cond)) { if (tidx == -1 || threadIdx.x == tidx) printf("Kernel assert failed: %s\n", #cond); return; }
+#define CUDA_ASSERT(cond, tidx) if (!(cond)) { if (tidx == -1 || threadIdx.x == tidx && tp == 0) printf("Kernel assert failed: %s\n", #cond); return; }
 #define STATIC_PRINT(num) template <int> struct static_print; static_assert(static_print<num>::x, "");
 
 using namespace kittens;
 using wg = kittens::warpgroup;
 
 constexpr int G = WARPGROUP_WARPS;
-constexpr int NUM_WORKERS = G; // TODO: why is one warpgroup optimal?
+constexpr int PRODUCER_WARPGROUPS = 1;
+constexpr int CONSUMER_WARPGROUPS = 1;
+constexpr int NUM_WORKERS = (PRODUCER_WARPGROUPS+CONSUMER_WARPGROUPS)*G;
 
-template<int B=1, int H=1, int N=16, int F=64, int K=4, int TP=4>
+template<ducks::st::all ST>
+__device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp) {
+    __shared__ semaphore dsmem_semaphore[2];
+    
+    if (wg::warpid() == 0) {
+        init_semaphore(dsmem_semaphore[0], 0, 1);
+        tma::expect_bytes(dsmem_semaphore[0], sizeof(tile_other));
+        init_semaphore(dsmem_semaphore[1], 0, 1);
+        tma::expect_bytes(dsmem_semaphore[1], sizeof(tile_other));
+    }
+    tma::cluster::sync();
+
+    for(int stage = 0; stage < 2; stage++) {
+        if (wg::warpid() == 0) {
+            tma::cluster::store_async(tile_other, tile, tp ^ (1 << stage), dsmem_semaphore[stage]);
+            wait(dsmem_semaphore[stage], 0);
+        }
+        wg::sync(1); // hold other threads here
+        wg::add(tile, tile, tile_other);
+    }
+}
+
+template<int B, int H, int NC, int N, int F, int K, int TP>
 __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
 __cluster_dims__(TP)
 __global__ void ttt_tp_forward_ker(
     // TODO: make B and H runtime dimensions by instantiating templates with -1 args
-    const __grid_constant__ gl<bf16, B, H, N, F> XQ_gl,
-    const __grid_constant__ gl<bf16, B, H, N, F> XK_gl,
-    const __grid_constant__ gl<bf16, B, H, N, F> XV_gl,
-    const __grid_constant__ gl<bf16, B, H, F, F*K> W1_gl,
-    const __grid_constant__ gl<bf16, B, H, F*K, F> W2_gl,
-    const __grid_constant__ gl<bf16, B, H, N, F> out_gl,
+    const __grid_constant__ gl<bf16, B, H, NC*N, F, st_bf<N, F>> XQ_gl,
+    const __grid_constant__ gl<bf16, B, H, NC*N, F, st_bf<N, F>> XK_gl,
+    const __grid_constant__ gl<bf16, B, H, NC*N, F, st_bf<N, F>> XV_gl,
+    const __grid_constant__ gl<bf16, B, H, F, F*K, st_bf<F, F*K/TP>> W1_gl,
+    const __grid_constant__ gl<bf16, B, H, F*K, F, st_bf<F*K/TP, F>> W2_gl,
+    const __grid_constant__ gl<bf16, B, H, NC*N, F, st_bf<N, F>> out_gl,
     bool *signal
 ) {
+    // b = batch, h = head, tp = TP rank
     int b = blockIdx.y;
     int h = blockIdx.z;
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     int tp = cluster.block_rank();
     CUDA_ASSERT(tp == blockIdx.x, 0);
 
-    extern __shared__ int __shm[(N*F+F*F*K/TP+F*K/TP*N+F*K/TP*F+F*N+F*N)*sizeof(bf16)/sizeof(int)];
+    // Define shared memory size
+    constexpr int _X = N*F;
+    constexpr int _W = F*F*K/TP;
+    constexpr int _Xexp = N*F*K/TP;
+    extern __shared__ int __shm[(_X+_X+_X+_W+_Xexp+_W+_X+_X)*sizeof(bf16)/sizeof(int)];
     tma_swizzle_allocator al((int*)&__shm[0]);
 
+    // Define shared memory tiles
+    st_bf<N, F> &XQ = al.allocate<typeof(XQ)>();
     st_bf<N, F> &XK = al.allocate<typeof(XK)>();
+    st_bf<N, F> &XV = al.allocate<typeof(XV)>();
     st_bf<F, F*K/TP> &W1 = al.allocate<typeof(W1)>();
-    rt_fl<F*K/TP/G, N> Z1_reg;
     st_bf<F*K/TP, N> &X2 = al.allocate<typeof(X2)>();
     st_bf<F*K/TP, F> &W2 = al.allocate<typeof(W2)>();
-    rt_fl<F/G, N> Z2_reg;
     st_bf<F, N> &Z2 = al.allocate<typeof(Z2)>();
-    st_bf<F, N> &Z2_other = al.allocate<typeof(Z2_other)>();
+    st_bf<F, N> &Z2_reduce_other = al.allocate<typeof(Z2_reduce_other)>();
 
-    static_assert(sizeof(XK)+sizeof(W1)+sizeof(X2)+sizeof(W2)+sizeof(Z2)+sizeof(Z2_other) == sizeof(__shm), "Incorrect shared memory allocation");
+    static_assert(sizeof(XQ)+sizeof(XK)+sizeof(XV)+sizeof(W1)+sizeof(X2)+sizeof(W2)+sizeof(Z2)+sizeof(Z2_reduce_other) == sizeof(__shm), "Incorrect shared memory allocation");
 
-    wg::load(XK, XK_gl, {b, h, 0, 0});
-    wg::load(W1, W1_gl, {b, h, 0, tp});
-    wg::mm_AtBt(Z1_reg, W1, XK);
-    wg::mma_commit_group(); // might be able to remove this line
-    wg::mma_async_wait();
-    wg::store(X2, Z1_reg);
-    
-    wg::load(W2, W2_gl, {b, h, tp, 0});
-    wg::mm_AtB(Z2_reg, W2, X2);
-    wg::mma_commit_group();
-    wg::mma_async_wait();
-    wg::store(Z2, Z2_reg);
-
-    // Square All-Reduce! :D
-    __shared__ semaphore dsmem_semaphore[2];
-    if (wg::warpid() == 0) {
-        init_semaphore(dsmem_semaphore[0], 0, 1);
-        tma::expect_bytes(dsmem_semaphore[0], sizeof(Z2_other));
+    __shared__ semaphore w1_sem, w2_sem, q_sem, k_sem, v_sem, minibatch_done;
+    if (wg::groupid() == 0 && wg::warpid() == 0) {
+        init_semaphore(w1_sem, 0, 1);
+        init_semaphore(w2_sem, 0, 1);
+        init_semaphore(q_sem, 0, 1);
+        init_semaphore(k_sem, 0, 1);
+        init_semaphore(v_sem, 0, 1);
+        init_semaphore(minibatch_done, CONSUMER_WARPGROUPS, 0);
+        tma::expect_bytes(w1_sem, sizeof(W1));
+        tma::load_async(W1, W1_gl, {b, h, 0, tp}, w1_sem);
+        tma::expect_bytes(w2_sem, sizeof(W2));
+        tma::load_async(W2, W2_gl, {b, h, tp, 0}, w2_sem);
+        tma::expect_bytes(k_sem, sizeof(XK));
+        tma::load_async(XK, XK_gl, {b, h, 0, 0}, k_sem);
+        tma::expect_bytes(v_sem, sizeof(XV));
+        tma::load_async(XV, XV_gl, {b, h, 0, 0}, v_sem);
+        tma::expect_bytes(q_sem, sizeof(XQ));
+        tma::load_async(XQ, XQ_gl, {b, h, 0, 0}, q_sem);
     }
-    tma::cluster::sync();
-    if (wg::warpid() == 0) {
-        tma::cluster::store_async(Z2_other, Z2, tp ^ 1, dsmem_semaphore[0]);
-        wait(dsmem_semaphore[0], 0);
-    }
-    wg::sync(1); // hold other threads here
-    wg::add(Z2, Z2, Z2_other);
+    __syncthreads();
 
-    if (wg::warpid() == 0) {
-        init_semaphore(dsmem_semaphore[1], 0, 1);
-        tma::expect_bytes(dsmem_semaphore[1], sizeof(Z2_other));
-    }
-    tma::cluster::sync();
-    if (wg::warpid() == 0) {
-        tma::cluster::store_async(Z2_other, Z2, tp ^ 2, dsmem_semaphore[1]);
-        wait(dsmem_semaphore[1], 0);
-    }
-    wg::sync(1);
-    wg::add(Z2, Z2, Z2_other);
+    if (wg::groupid() == CONSUMER_WARPGROUPS) {
+        // warpgroup::decrease_registers<32>(); //TODO: TUNE
+        tma::cluster::arrive_aligned();
 
-    if (tp == 0 && wg::laneid() == 0)
-        printf("After All-Reduce:\n");
-    for (int g = 0; g < G; g++) {
-        if (tp == g and wg::laneid() == 0) {
-            printf("TP %d: ", tp);
-            for (int i = 0; i < 10; i++) {
-                printf("%f ", __bfloat162float(Z2[i]));
+        for (int i = 1; i < NC; i++) {
+            wait(minibatch_done, (i+1)%2); // TODO: Why can't this be run only on Warp 0?
+            if (wg::warpid() == 0) {
+                tma::expect_bytes(k_sem, sizeof(XK));
+                tma::load_async(XK, XK_gl, {b, h, i, 0}, k_sem);
+                tma::expect_bytes(v_sem, sizeof(XV));
+                tma::load_async(XV, XV_gl, {b, h, i, 0}, v_sem);
+                tma::expect_bytes(q_sem, sizeof(XQ));
+                tma::load_async(XQ, XQ_gl, {b, h, i, 0}, q_sem);
             }
-            printf("\n");
+            wg::sync(1);
+            tma::cluster::arrive_aligned();
         }
-        tma::cluster::sync();
+        wait(minibatch_done, NC%2);
+    } else {
+        // warpgroup::increase_registers<32>();
+        rt_fl<F*K/TP/G, N> Z1_reg;
+        rt_fl<F/G, N> Z2_reg;
+
+        for (int i = 0; i < NC; i++) {
+            wait(k_sem, 0);
+            if (i == 0) wait(w1_sem, 0);
+            wg::mm_AtBt(Z1_reg, W1, XK);
+            wg::mma_commit_group(); // might be able to remove this line
+            wg::mma_async_wait();
+            wg::store(X2, Z1_reg);
+
+            if (i == 0) wait(w2_sem, 0);
+            wg::mm_AtB(Z2_reg, W2, X2);
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+            wg::store(Z2, Z2_reg);
+            square_all_reduce(Z2, Z2_reduce_other, tp);
+
+            if (wg::laneid() == 0) arrive(minibatch_done, 1);
+        }
     }
-    
+
+    __syncthreads();
     *signal = true;
 }
 
@@ -143,20 +185,20 @@ extern torch::Tensor ttt_tp_forward(
 }//*/
 
 int main() {
-    constexpr int B = 1, H = 1, N = 16, F = 64, K = 4, TP = 4;
+    constexpr int B = 8, H = 32, NC = 16, N = 16, F = 64, K = 4, TP = 4;
 
     bf16 *h_XQ, *h_XK, *h_XV, *h_W1, *h_W2, *h_out;
 
     // Allocate host memory
-    h_XQ = (bf16*)malloc(B*H*N*F*sizeof(bf16));
-    h_XK = (bf16*)malloc(B*H*N*F*sizeof(bf16));
-    h_XV = (bf16*)malloc(B*H*N*F*sizeof(bf16));
+    h_XQ = (bf16*)malloc(B*H*NC*N*F*sizeof(bf16));
+    h_XK = (bf16*)malloc(B*H*NC*N*F*sizeof(bf16));
+    h_XV = (bf16*)malloc(B*H*NC*N*F*sizeof(bf16));
     h_W1 = (bf16*)malloc(B*H*F*F*K*sizeof(bf16));
     h_W2 = (bf16*)malloc(B*H*F*K*F*sizeof(bf16));
-    h_out = (bf16*)malloc(B*H*N*F*sizeof(bf16));
+    h_out = (bf16*)malloc(B*H*NC*N*F*sizeof(bf16));
 
     // Initialize host arrays
-    for (int i = 0; i < B*H*N*F; i++) {
+    for (int i = 0; i < B*H*NC*N*F; i++) {
         h_XQ[i] = __int2bfloat16_rn(i);
         h_XK[i] = __int2bfloat16_rn(i);
         h_XV[i] = __int2bfloat16_rn(i);
@@ -170,20 +212,20 @@ int main() {
     bf16 *XQ, *XK, *XV, *W1, *W2, *out;
 
     // Allocate device memory
-    cudaMalloc(&XQ, B*H*N*F*sizeof(bf16));
-    cudaMalloc(&XK, B*H*N*F*sizeof(bf16));
-    cudaMalloc(&XV, B*H*N*F*sizeof(bf16));
+    cudaMalloc(&XQ, B*H*NC*N*F*sizeof(bf16));
+    cudaMalloc(&XK, B*H*NC*N*F*sizeof(bf16));
+    cudaMalloc(&XV, B*H*NC*N*F*sizeof(bf16));
     cudaMalloc(&W1, B*H*F*F*K*sizeof(bf16));
     cudaMalloc(&W2, B*H*F*K*F*sizeof(bf16));
-    cudaMalloc(&out, B*H*N*F*sizeof(bf16));
+    cudaMalloc(&out, B*H*NC*N*F*sizeof(bf16));
 
     // Copy data from host to device
-    cudaMemcpy(XQ, h_XQ, B*H*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(XK, h_XK, B*H*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(XV, h_XV, B*H*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(XQ, h_XQ, B*H*NC*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(XK, h_XK, B*H*NC*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(XV, h_XV, B*H*NC*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
     cudaMemcpy(W1, h_W1, B*H*F*F*K*sizeof(bf16), cudaMemcpyHostToDevice);
     cudaMemcpy(W2, h_W2, B*H*F*K*F*sizeof(bf16), cudaMemcpyHostToDevice);
-    cudaMemcpy(out, h_out, B*H*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(out, h_out, B*H*NC*N*F*sizeof(bf16), cudaMemcpyHostToDevice);
 
     bool *h_signal = (bool *)malloc(sizeof(bool)), *signal;
     cudaMalloc(&signal, sizeof(bool));
@@ -192,13 +234,13 @@ int main() {
 
     printf("Launching kernel\n");
 
-    ttt_tp_forward_ker<B, H, N, F, K, TP><<<dim3(TP, B, H), NUM_WORKERS*kittens::WARP_THREADS>>>(
-        gl<bf16, B, H, N, F>{XQ, nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, N, F>{XK, nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, N, F>{XV, nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, F, F*K>{W1, nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, F*K, F>{W2, nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, N, F>{out, nullptr, nullptr, nullptr, nullptr},
+    ttt_tp_forward_ker<B, H, NC, N, F, K, TP><<<dim3(TP, B, H), NUM_WORKERS*kittens::WARP_THREADS>>>(
+        gl<bf16, B, H, NC*N, F, st_bf<N, F>>{XQ, nullptr, nullptr, nullptr, nullptr},
+        gl<bf16, B, H, NC*N, F, st_bf<N, F>>{XK, nullptr, nullptr, nullptr, nullptr},
+        gl<bf16, B, H, NC*N, F, st_bf<N, F>>{XV, nullptr, nullptr, nullptr, nullptr},
+        gl<bf16, B, H, F, F*K, st_bf<F, F*K/TP>>{W1, nullptr, nullptr, nullptr, nullptr},
+        gl<bf16, B, H, F*K, F, st_bf<F*K/TP, F>>{W2, nullptr, nullptr, nullptr, nullptr},
+        gl<bf16, B, H, NC*N, F, st_bf<N, F>>{out, nullptr, nullptr, nullptr, nullptr},
         signal
     );
 
