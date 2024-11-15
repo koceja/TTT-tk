@@ -170,6 +170,7 @@ __global__ void ttt_tp_forward_ker(
 
             // Compute Z1_bar using Z1_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
+            make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
             wg::mma_AB(cs_tp_reg, cs_cs_bf_reg, grad_l_wrt_Z1);
             wg::mma_commit_group();
             wg::mma_async_wait();
@@ -183,6 +184,7 @@ __global__ void ttt_tp_forward_ker(
 
             // Compute Z2_bar using Z2_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
+            make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
             wg::mma_AB(cs_tp_reg, cs_cs_bf_reg, grad_l_wrt_Z2);
             wg::mma_commit_group();
             wg::mma_async_wait();
