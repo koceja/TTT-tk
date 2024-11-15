@@ -20,29 +20,28 @@ template<int TP, ducks::st::all ST>
 __device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp);
 
 template<int TP, ducks::st::all ST>
-__device__ __forceinline__ void square_all_reduce<1, ST>(ST &tile, ST &tile_other, int tp) {
-    tma::cluster::arrive_aligned();
-}
+__device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp) {
+    if constexpr (TP == 1) {
+        tma::cluster::arrive_aligned();
+    } else {
+        __shared__ semaphore dsmem_semaphore[2];
 
-template<ducks::st::all ST>
-__device__ __forceinline__ void square_all_reduce<4, ST>(ST &tile, ST &tile_other, int tp) {
-    __shared__ semaphore dsmem_semaphore[2];
-    
-    if (wg::warpid() == 0) {
-        init_semaphore(dsmem_semaphore[0], 0, 1);
-        tma::expect_bytes(dsmem_semaphore[0], sizeof(tile_other));
-        init_semaphore(dsmem_semaphore[1], 0, 1);
-        tma::expect_bytes(dsmem_semaphore[1], sizeof(tile_other));
-    }
-    tma::cluster::sync();
-
-    for(int stage = 0; stage < 2; stage++) {
         if (wg::warpid() == 0) {
-            tma::cluster::store_async(tile_other, tile, tp ^ (1 << stage), dsmem_semaphore[stage]);
-            wait(dsmem_semaphore[stage], 0);
+            init_semaphore(dsmem_semaphore[0], 0, 1);
+            tma::expect_bytes(dsmem_semaphore[0], sizeof(tile_other));
+            init_semaphore(dsmem_semaphore[1], 0, 1);
+            tma::expect_bytes(dsmem_semaphore[1], sizeof(tile_other));
         }
-        wg::sync(1);
-        wg::add(tile, tile, tile_other);
+        tma::cluster::sync();
+
+        for(int stage = 0; stage < 2; stage++) {
+            if (wg::warpid() == 0) {
+                tma::cluster::store_async(tile_other, tile, tp ^ (1 << stage), dsmem_semaphore[stage]);
+                wait(dsmem_semaphore[stage], 0);
+            }
+            wg::sync(1);
+            wg::add(tile, tile, tile_other);
+        }
     }
 }
 
@@ -114,8 +113,6 @@ __global__ void ttt_tp_forward_ker(
         wg::producer_registers();
         tma::cluster::arrive_aligned();
         wait(minibatch_first_reduction_done, 0);
-        tma::cluster::arrive_aligned();
-
 
         for (int i = 1; i < NC; i++) {
             wait(minibatch_done, (i+1)%2); // Wait for the previous minibatch to complete
@@ -130,16 +127,16 @@ __global__ void ttt_tp_forward_ker(
             wg::sync(1); // Sync all warps in producer warpgroup
             tma::cluster::arrive_aligned();
             wait(minibatch_first_reduction_done, i%2);
-            tma::cluster::arrive_aligned();
         }
     } else {
         wg::consumer_registers<CONSUMER_WARPGROUPS>();
         rt_fl<N/G, F*K/TP> cs_tp_reg;
         rt_fl<N/G, N> cs_cs_fl_reg;
         rt_bf<N/G, N> cs_cs_bf_reg;
-        
+
 
         for (int i = 0; i < NC; i++) {
+            // Hidden state forward
             wait(k_sem, i%2);
             if (i == 0) wait(w1_sem, 0);
             wg::mm_AB(cs_tp_reg, XK, W1);
@@ -153,8 +150,8 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_async_wait();
             wg::store(Z2, cs_tp_reg);
 
+            // All reduce across SM cluster
             square_all_reduce<TP>(Z2, reduction_buffer, tp);
-
             if (wg::laneid() == 0) arrive(minibatch_first_reduction_done, 1);
 
             // Calculate (negative) grad_l_wrt_Z2 / grad_l_wrt_Z1 (store into SMEM)
@@ -204,9 +201,8 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_async_wait();
             wg::store(W2, cs_cs_fl_reg);
 
-            // TODO: We should get rid of this square_all_reduce and instead directly store Z2_bar into global memory
+            // TODO: Store Z2_bar into global memory
             wg::store(Z2_bar, cs_tp_reg);
-            square_all_reduce<TP>(Z2_bar, reduction_buffer, tp);
 
             if (wg::laneid() == 0) arrive(minibatch_done, 1);
         }
