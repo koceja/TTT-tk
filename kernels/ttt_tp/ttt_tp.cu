@@ -82,7 +82,13 @@ __global__ void ttt_tp_forward_ker(
     st_bf<F*K/TP, N> &Z1_bar = al.allocate<typeof(Z1_bar)>();
     st_bf<F*K/TP, N> &Z2_bar = al.allocate<typeof(Z2_bar)>();
 
-    static_assert(sizeof(XQ)+sizeof(XK)+sizeof(XV)+sizeof(W1)+sizeof(Z1)+sizeof(W2)+sizeof(Z2)+sizeof(reduction_buffer)+sizeof(grad_l_wrt_Z1)+sizeof(Z1_bar)+sizeof(Z2_bar) <= MAX_SHARED_MEMORY-8192, "Incorrect shared memory allocation");
+    constexpr size_t total_size = sizeof(XQ) + sizeof(XK) + sizeof(XV) + 
+                                 sizeof(W1) + sizeof(W2) + sizeof(Z1) + 
+                                 sizeof(Z2) + sizeof(reduction_buffer) +
+                                 sizeof(grad_l_wrt_Z1) + sizeof(Z1_bar) + 
+                                 sizeof(Z2_bar);
+    static_assert(total_size <= MAX_SHARED_MEMORY-8192, 
+                 "Total shared memory allocation exceeds available space");
 
     // Define semaphores and preload data
     __shared__ semaphore w1_sem, w2_sem, q_sem, k_sem, v_sem, minibatch_first_reduction_done, minibatch_done;
@@ -212,46 +218,6 @@ __global__ void ttt_tp_forward_ker(
     __syncthreads();
     *signal = true;
 }
-
-/*
-extern torch::Tensor ttt_tp_forward(
-    const torch::Tensor XQ,
-    const torch::Tensor XK,
-    const torch::Tensor XV,
-    const torch::Tensor W1,
-    const torch::Tensor W2,
-    const torch::Tensor out
-) {
-    constexpr int B = 1, H = 1, N = 16, F = 64, K = 4, TP = 4;
-
-    // TODO: better macro
-    TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 4 && XQ.size(0) == B && XQ.size(1) == H && XQ.size(2) == N && XQ.size(3) == F, "XQ");
-    TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 4 && XK.size(0) == B && XK.size(1) == H && XK.size(2) == N && XK.size(3) == F, "XK");
-    TORCH_CHECK(XV.device().is_cuda() && XV.is_contiguous() && XV.dim() == 4 && XV.size(0) == B && XV.size(1) == H && XV.size(2) == N && XV.size(3) == F, "XV");
-    TORCH_CHECK(W1.device().is_cuda() && W1.is_contiguous() && W1.dim() == 4 && W1.size(0) == B && W1.size(1) == H && W1.size(2) == F && W1.size(3) == F*K, "W1");
-    TORCH_CHECK(W2.device().is_cuda() && W2.is_contiguous() && W2.dim() == 4 && W2.size(0) == B && W2.size(1) == H && W2.size(2) == F*K && W2.size(3) == F, "W2");
-    TORCH_CHECK(out.device().is_cuda() && out.is_contiguous() && out.dim() == 4 && out.size(0) == B && out.size(1) == H && out.size(2) == N && out.size(3) == F, "out");
-
-    bool *h_signal = (bool *)malloc(sizeof(bool)), *signal;
-    cudaMalloc(&signal, sizeof(bool));
-    *h_signal = false;
-    cudaMemcpy(signal, h_signal, sizeof(bool), cudaMemcpyHostToDevice);
-
-    ttt_tp_forward_ker<B, H, N, F, K, TP><<<dim3(TP, B, H), NUM_WORKERS*kittens::WARP_THREADS>>>(
-        gl<bf16, B, H, N, F>{reinterpret_cast<bf16*>(XQ.data_ptr<at::BFloat16>()), nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, N, F>{reinterpret_cast<bf16*>(XK.data_ptr<at::BFloat16>()), nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, N, F>{reinterpret_cast<bf16*>(XV.data_ptr<at::BFloat16>()), nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, F, F*K>{reinterpret_cast<bf16*>(W1.data_ptr<at::BFloat16>()), nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, F*K, F>{reinterpret_cast<bf16*>(W2.data_ptr<at::BFloat16>()), nullptr, nullptr, nullptr, nullptr},
-        gl<bf16, B, H, N, F>{reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>()), nullptr, nullptr, nullptr, nullptr},
-        signal
-    );
-
-    cudaMemcpy(h_signal, signal, sizeof(bool), cudaMemcpyDeviceToHost);
-    TORCH_CHECK(*h_signal, "Kernel failed, *signal=true not set");
-
-    return out;
-}//*/
 
 int main() {
     constexpr int B = 1, H = 1, NC = 1, N = 64, F = 64, K = 4, TP = 4;
