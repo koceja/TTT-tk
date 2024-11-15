@@ -134,7 +134,6 @@ __global__ void ttt_tp_forward_ker(
         rt_fl<N/G, N> cs_cs_fl_reg;
         rt_bf<N/G, N> cs_cs_bf_reg;
 
-
         for (int i = 0; i < NC; i++) {
             // Hidden state forward
             wait(k_sem, i%2);
@@ -188,6 +187,9 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_commit_group();
             wg::mma_async_wait();
 
+            // TODO: Store Z2_bar into global memory
+            wg::store(Z2_bar, cs_tp_reg);
+
             // Update hidden states (TODO: Is there a more efficient way to do this?)
             wg::load(cs_cs_fl_reg, W1);
             wg::mma_AtB(cs_cs_fl_reg, XK, grad_l_wrt_Z1);
@@ -200,9 +202,6 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(W2, cs_cs_fl_reg);
-
-            // TODO: Store Z2_bar into global memory
-            wg::store(Z2_bar, cs_tp_reg);
 
             if (wg::laneid() == 0) arrive(minibatch_done, 1);
         }
