@@ -191,6 +191,19 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_commit_group();
             wg::mma_async_wait();
 
+            // Update hidden states (TODO: Is there a more efficient way to do this?)
+            wg::load(cs_cs_fl_reg, W1);
+            wg::mma_AtB(cs_cs_fl_reg, XK, grad_l_wrt_Z1);
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+            wg::store(W1, cs_cs_fl_reg);
+
+            wg::load(cs_cs_fl_reg, W2);
+            wg::mma_AtB(cs_cs_fl_reg, Z1, grad_l_wrt_Z2);
+            wg::mma_commit_group();
+            wg::mma_async_wait();
+            wg::store(W2, cs_cs_fl_reg);
+
             // TODO: We should get rid of this square_all_reduce and instead directly store Z2_bar into global memory
             wg::store(Z2_bar, cs_tp_reg);
             square_all_reduce<TP>(Z2_bar, reduction_buffer, tp);
