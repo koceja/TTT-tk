@@ -17,13 +17,11 @@ constexpr int CONSUMER_WARPGROUPS = 1;
 constexpr int NUM_WORKERS = (PRODUCER_WARPGROUPS+CONSUMER_WARPGROUPS)*G;
 
 template<int TP, ducks::st::all ST>
-__device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp);
-
-template<int TP, ducks::st::all ST>
 __device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int tp) {
     if constexpr (TP == 1) {
         tma::cluster::arrive_aligned();
     } else {
+        static_assert(TP == 4, "TP must be 4 for this square_all_reduce implementation");
         __shared__ semaphore dsmem_semaphore[2];
 
         if (wg::warpid() == 0) {
@@ -123,6 +121,7 @@ __global__ void ttt_tp_forward_ker(
         for (int i = 1; i < NC; i++) {
             wait(minibatch_done, (i+1)%2); // Wait for the previous minibatch to complete
             if (wg::warpid() == 0) {
+                // TODO: Prefetch the next minibatch into L2 cache
                 tma::expect_bytes(k_sem, sizeof(XK));
                 tma::load_async(XK, XK_gl, {b, h, i, 0}, k_sem);
                 tma::expect_bytes(q_sem, sizeof(XQ));
@@ -195,8 +194,13 @@ __global__ void ttt_tp_forward_ker(
             wg::mma_commit_group();
             wg::mma_async_wait();
 
-            // TODO: Store Z2_bar into global memory
+            // TODO: perhaps make Z2_bar share memory with Z1_bar. Move store_async_read_wait to immediately above wg::store(Z1_bar, ...)
+            if (i != 0) tma::store_async_read_wait(); // Wait until clear to start editing Z2_bar
             wg::store(Z2_bar, cs_tp_reg);
+            if (wg::warpid() == 0) {
+                tma::store_add_async(out_gl, Z2_bar, {b, h, i, 0});
+                tma::store_commit_group();
+            }
 
             // Update hidden states (TODO: Is there a more efficient way to do this?)
             wg::load(cs_cs_fl_reg, W1);
@@ -213,6 +217,7 @@ __global__ void ttt_tp_forward_ker(
 
             if (wg::laneid() == 0) arrive(minibatch_done, 1);
         }
+        tma::store_async_wait();
     }
 
     __syncthreads();
@@ -237,7 +242,7 @@ int main() {
         h_XQ[i] = __int2bfloat16_rn(i);
         h_XK[i] = __int2bfloat16_rn(i);
         h_XV[i] = __int2bfloat16_rn(i);
-        h_out[i] = __int2bfloat16_rn(-1);
+        h_out[i] = __int2bfloat16_rn(0);
     }
     for (int i = 0; i < B*H*F*F*K; i++) {
         h_W1[i] = __int2bfloat16_rn(i);
