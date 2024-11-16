@@ -22,6 +22,7 @@ template<int D> struct fwd_attend_ker_tile_dims {};
 template<> struct fwd_attend_ker_tile_dims<64> {
     constexpr static int tile_width = (64);
     constexpr static int tile_height = (64);
+    constexpr static int stages     = (2); 
 };
 
 template<int D> struct fwd_globals {
@@ -100,17 +101,17 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     using w1_tile   =         st_bf<K::tile_height, K::tile_width>;
     using w2_tile   =         st_bf<K::tile_height, K::tile_width>;
 
-    w1_tile    (&w1_smem)                   = al.allocate<w1_tile>();
-    w2_tile    (&w2_smem)                   = al.allocate<w2_tile>();
+    w1_tile   (&w1_smem)                   = al.allocate<w1_tile>();
+    w2_tile   (&w2_smem)                   = al.allocate<w2_tile>();
 
-    q_tile    (&q_smem)                    = al.allocate<q_tile>();
-    k_tile    (&k_smem)                    = al.allocate<k_tile>();
-    v_tile    (&v_smem)                    = al.allocate<v_tile>();
+    q_tile    (&q_smem)[K::stages]         = al.allocate<q_tile, K::stages>();
+    k_tile    (&k_smem)[K::stages]         = al.allocate<k_tile, K::stages>();
+    v_tile    (&v_smem)[K::stages]         = al.allocate<v_tile, K::stages>();
 
-    z1_tile    (&z1_smem)                   = al.allocate<z1_tile>();
-    z2_tile    (&z2_smem)                   = al.allocate<z2_tile>();
-    grad_z1_tile    (&grad_z1_smem)         = al.allocate<grad_z1_tile>();
-    rd_buffer_tile    (&rd_buffer_smem)      = al.allocate<rd_buffer_tile>();
+    z1_tile   (&z1_smem)                   = al.allocate<z1_tile>();
+    z2_tile   (&z2_smem)                   = al.allocate<z2_tile>();
+    grad_z1_tile  (&grad_z1_smem)          = al.allocate<grad_z1_tile>();
+    rd_buffer_tile (&rd_buffer_smem)       = al.allocate<rd_buffer_tile>();
 
     int batch_idx   = blockIdx.y;
     int head_idx    = blockIdx.z;
@@ -120,15 +121,22 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     int tp_idx = cluster.block_rank();
     CUDA_ASSERT(tp_idx == blockIdx.x, 0);
 
-    __shared__ kittens::semaphore w1_smem_arrived, w2_smem_arrived, q_sem_arrived, k_sem_arrived, v_sem_arrived, reduction_done, compute_done;
+    __shared__ kittens::semaphore 
+        w1_smem_arrived,
+        w2_smem_arrived,
+        q_sem_arrived[K::stages],
+        k_sem_arrived[K::stages], 
+        v_sem_arrived[K::stages],
+        compute_done[K::stages];
     if (threadIdx.x == 0) { 
         init_semaphore(w1_smem_arrived, 0, 1);
         init_semaphore(w2_smem_arrived, 0, 1);
-        init_semaphore(q_sem_arrived, 0, 1); 
-        init_semaphore(k_sem_arrived, 0, 1); 
-        init_semaphore(v_sem_arrived, 0, 1); 
-        init_semaphore(reduction_done, CONSUMER_WARPGROUPS, 0);
-        init_semaphore(compute_done, CONSUMER_WARPGROUPS, 0);
+        for (int i = 0; i < K::stages; i++) {
+            init_semaphore(q_sem_arrived[i], 0, 1);
+            init_semaphore(k_sem_arrived[i], 0, 1);
+            init_semaphore(v_sem_arrived[i], 0, 1);
+            init_semaphore(compute_done[i], CONSUMER_WARPGROUPS, 0);
+        }
 
         tma::expect_bytes(w1_smem_arrived, sizeof(w1_tile));
         tma::load_async(w1_smem, g.w1, {batch_idx, head_idx, 0, tp_idx}, w1_smem_arrived);
@@ -136,18 +144,19 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         tma::expect_bytes(w2_smem_arrived, sizeof(w2_tile));
         tma::load_async(w2_smem, g.w2, {batch_idx, head_idx, tp_idx, 0}, w2_smem_arrived);
 
+        // Preload 1 minibatch
         int4 tile_idx = {batch_idx, head_idx, 0, 0};
 
-        tma::expect_bytes(q_sem_arrived, sizeof(q_tile));
-        tma::load_async(q_smem, g.q, tile_idx, q_sem_arrived);
+        tma::expect_bytes(k_sem_arrived[0], sizeof(k_tile));
+        tma::load_async(k_smem[0], g.k, tile_idx, k_sem_arrived[0]);
 
-        tma::expect_bytes(k_sem_arrived, sizeof(k_tile));
-        tma::load_async(k_smem, g.k, tile_idx, k_sem_arrived);
+        tma::expect_bytes(v_sem_arrived[0], sizeof(v_tile));
+        tma::load_async(v_smem[0], g.v, tile_idx, v_sem_arrived[0]);
 
-        tma::expect_bytes(v_sem_arrived, sizeof(v_tile));
-        tma::load_async(v_smem, g.v, tile_idx, v_sem_arrived);
+        tma::expect_bytes(q_sem_arrived[0], sizeof(q_tile));
+        tma::load_async(q_smem[0], g.q, tile_idx, q_sem_arrived[0]);
     }
-    __syncthreads(); 
+    __syncthreads();
 
     if(warpgroupid == NUM_WARPGROUPS-1) {
         warpgroup::decrease_registers<32>();    
@@ -156,24 +165,21 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         int iters; 
         iters = n_minibatch - 1;
 
-        kittens::wait(reduction_done, 0);
         if (warpid == NUM_WORKERS-4) {
             for (auto idx = 0; idx < iters; idx++) {
-                kittens::wait(reduction_done, idx % 2);
-                kittens::wait(compute_done, idx % 2);
-                
                 int4 tile_idx = {batch_idx, head_idx, idx + 1, 0};
 
-                tma::expect_bytes(q_sem_arrived, sizeof(q_tile));
-                tma::load_async(q_smem, g.q, tile_idx, q_sem_arrived);
+                tma::expect_bytes(k_sem_arrived[(idx + 1) % K::stages], sizeof(k_tile));
+                tma::load_async(k_smem[(idx + 1) % K::stages], g.k, tile_idx, k_sem_arrived[(idx + 1) % K::stages]);
 
-                tma::expect_bytes(k_sem_arrived, sizeof(k_tile));
-                tma::load_async(k_smem, g.k, tile_idx, k_sem_arrived);
+                tma::expect_bytes(v_sem_arrived[(idx + 1) % K::stages], sizeof(v_tile));
+                tma::load_async(v_smem[(idx + 1) % K::stages], g.v, tile_idx, v_sem_arrived[(idx + 1) % K::stages]);
 
-                tma::expect_bytes(v_sem_arrived, sizeof(v_tile));
-                tma::load_async(v_smem, g.v, tile_idx, v_sem_arrived);
+                tma::expect_bytes(q_sem_arrived[(idx + 1) % K::stages], sizeof(q_tile));
+                tma::load_async(q_smem[(idx + 1) % K::stages], g.q, tile_idx, q_sem_arrived[(idx + 1) % K::stages]);
 
-                // warpgroup::sync(NUM_WARPGROUPS-1); TODO: Is this needed?
+                // Wait on previous stage to finish computation
+                kittens::wait(compute_done[idx % K::stages], (idx/K::stages) % 2);
                 tma::cluster::arrive_aligned();
             }
         }
@@ -190,9 +196,9 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         
         for (auto idx = 0; idx < n_minibatch; idx++) {
             // Hidden State Forward
-            kittens::wait(k_sem_arrived, idx % 2);
+            kittens::wait(k_sem_arrived[idx % K::stages], (idx/K::stages) % 2);
 
-            warpgroup::mm_AB(cs_cs_fl_reg, k_smem, w1_smem);
+            warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], w1_smem);
             warpgroup::mma_async_wait();
             warpgroup::store(z1_smem, cs_cs_fl_reg);
 
@@ -202,20 +208,19 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
             // Reduction over SM
             square_all_reduce<TP>(z2_smem, rd_buffer_smem, tp_idx);
-            if (warpgroup::laneid() == 0) arrive(reduction_done, 1);
 
             // Calculate (negative) grad_l_wrt_Z2 / grad_l_wrt_Z1
             // We use negative gradients to use the WGMMA accumulator
-            kittens::wait(v_sem_arrived, idx % 2);
-            warpgroup::sub(z2_smem, z2_smem, v_smem); // grad_l_wrt_Z2 is stored into z2_smem
+            kittens::wait(v_sem_arrived[idx % K::stages], (idx/K::stages) % 2);
+            warpgroup::sub(z2_smem, z2_smem, v_smem[idx % K::stages]); // grad_l_wrt_Z2 is stored into z2_smem
             warpgroup::mm_ABt(cs_cs_fl_reg, z2_smem, w2_smem);
             warpgroup::mma_async_wait();
             warpgroup::store(grad_z1_smem, cs_cs_fl_reg);
 
             // Compute Attn1 and Z1_bar partial (on registers)
-            kittens::wait(q_sem_arrived, idx % 2);
-            warpgroup::mm_ABt(cs_cs_fl_reg, q_smem, k_smem);
-            warpgroup::mm_AB(cs_cs_2_fl_reg, q_smem, w1_smem); // Z1_bar partial
+            kittens::wait(q_sem_arrived[idx % K::stages], (idx/K::stages) % 2);
+            warpgroup::mm_ABt(cs_cs_fl_reg, q_smem[idx % K::stages], k_smem[idx % K::stages]);
+            warpgroup::mm_AB(cs_cs_2_fl_reg, q_smem[idx % K::stages], w1_smem); // Z1_bar partial
             
             // Compute Z1_bar using Z1_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
@@ -244,7 +249,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
             // Update hidden states
             warpgroup::load(cs_cs_fl_reg, w1_smem);
-            warpgroup::mma_AtB(cs_cs_fl_reg, k_smem, grad_z1_smem);
+            warpgroup::mma_AtB(cs_cs_fl_reg, k_smem[idx % K::stages], grad_z1_smem);
             warpgroup::mma_async_wait();
             warpgroup::store(w1_smem, cs_cs_fl_reg);
 
@@ -253,7 +258,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::mma_async_wait();
             warpgroup::store(w2_smem, cs_cs_fl_reg);
 
-            if (warpgroup::laneid() == 0) arrive(compute_done, 1);
+            if (warpgroup::laneid() == 0) arrive(compute_done[idx % K::stages], 1);
         }
     }
 }
