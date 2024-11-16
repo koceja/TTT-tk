@@ -299,7 +299,7 @@ void ttt_mlp_forward_tp(
     globals::v_gl vg_arg{d_v, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
     globals::o_gl og_arg{d_o, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
 
-    globals::w1_gl w1g_arg{d_w1, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+    globals::w1_gl w1g_arg{d_w1, BATCH_SIZE, HEADS, HEAD_DIM, EXP_DIM};
     globals::w2_gl w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
 
     globals g{qg_arg, kg_arg, vg_arg, w1g_arg, w2g_arg, og_arg, SEQ_LEN};
