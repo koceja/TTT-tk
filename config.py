@@ -15,6 +15,11 @@ sources = {
             'h100': 'kernels/ttt_tp/ttt_tp.cu'
         }
     },
+    'ttt_mlp_forward_tp': {
+        'source_files': {
+            'h100': 'kernels/ttt/ttt.cu'
+        }
+    },
     'attn': {
         'source_files': {
             'h100': 'kernels/attn/h100/h100.cu' # define these source files for each GPU target desired.
@@ -69,7 +74,7 @@ sources = {
 
 ### WHICH KERNELS DO WE WANT TO BUILD?
 # (oftentimes during development work you don't need to redefine them all.)
-kernels = ['ttt_tp']
+kernels = ['ttt_mlp_forward_tp']
 
 ### WHICH GPU TARGET DO WE WANT TO BUILD FOR?
 target = 'h100'

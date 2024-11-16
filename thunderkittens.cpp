@@ -68,6 +68,22 @@ extern torch::Tensor ttt_tp_forward(
 #endif
 
 
+#ifdef TK_COMPILE_TTT_MLP_FORWARD_TP
+extern void ttt_mlp_forward_tp(
+    // const torch::Tensor ttt_norm_weight,
+    // const torch::Tensor ttt_norm_bias,
+    const torch::Tensor W1_init,
+    // const torch::Tensor b1_init,
+    const torch::Tensor W2_init,
+    // const torch::Tensor b2_init,
+    const torch::Tensor XQ_batch,
+    const torch::Tensor XV_batch,
+    const torch::Tensor XK_batch,
+    torch::Tensor output
+    // const torch::Tensor eta_batch
+);
+#endif
+
 ////////////////////////////////
 //// ThunderKittens Premade ////
 ////////////////////////////////
@@ -190,6 +206,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 #ifdef TK_COMPILE_TTT_TP
     m.def("ttt_tp_forward", &ttt_tp_forward, "TTT-TP Forward.");
+#endif
+
+#ifdef TK_COMPILE_TTT_MLP_FORWARD_TP
+    m.def("ttt_mlp_forward_tp", &ttt_mlp_forward_tp, "TTT-MLP forward with TP.");
 #endif
 
 #ifdef TK_COMPILE_ATTN

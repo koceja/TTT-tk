@@ -1,8 +1,11 @@
-// # Define TORCH_COMPILE macro
-
 #include "kittens.cuh"
 #include "cooperative_groups.h"
 #include <iostream>
+
+// Build torch entrypoint
+#ifdef TORCH_COMPILE
+#define TK_COMPILE_TTT_MLP_FORWARD_TP
+#endif
 
 #define CUDA_ASSERT(cond, tidx) if (!(cond)) { if (tidx == -1 || threadIdx.x == tidx && tp_idx == 0) printf("Kernel assert failed: %s\n", #cond); return; }
 
@@ -30,9 +33,9 @@ template<int D> struct fwd_globals {
     using w1_tile   =         st_bf<fwd_attend_ker_tile_dims<D>::tile_height, fwd_attend_ker_tile_dims<D>::tile_width>;
     using w2_tile   =         st_bf<fwd_attend_ker_tile_dims<D>::tile_height, fwd_attend_ker_tile_dims<D>::tile_width>;
 
-    using q_gl = gl<bf16,  -1, -1, -1, -1, q_tile>;
-    using k_gl = gl<bf16,  -1, -1, -1, -1, k_tile>;
-    using v_gl = gl<bf16,  -1, -1, -1, -1, v_tile>;
+    using q_gl = gl<bf16, -1, -1, -1, -1, q_tile>;
+    using k_gl = gl<bf16, -1, -1, -1, -1, k_tile>;
+    using v_gl = gl<bf16, -1, -1, -1, -1, v_tile>;
     using o_gl = gl<bf16, -1, -1, -1, -1, o_tile>;
 
     using w1_gl = gl<bf16, -1, -1, -1, -1, w1_tile>;
@@ -67,7 +70,7 @@ __device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int 
         for(int stage = 0; stage < 2; stage++) {
             if (warpgroup::warpid() == 0) {
                 tma::cluster::store_async(tile_other, tile, tp ^ (1 << stage), dsmem_semaphore[stage]);
-                wait(dsmem_semaphore[stage], 0);
+                kittens::wait(dsmem_semaphore[stage], 0);
             }
             warpgroup::sync(1);
             warpgroup::add(tile, tile, tile_other);
@@ -254,5 +257,68 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         }
     }
 }
+
+// Modified ttt_mlp_forward function
+#ifdef TK_COMPILE_TTT_MLP_FORWARD_TP
+#include "common/pyutils/torch_helpers.cuh"
+void ttt_mlp_forward_tp(
+    // const torch::Tensor ttt_norm_weight,
+    // const torch::Tensor ttt_norm_bias,
+    const torch::Tensor W1_init,
+    // const torch::Tensor b1_init,
+    const torch::Tensor W2_init,
+    // const torch::Tensor b2_init,
+    const torch::Tensor XQ_batch,
+    const torch::Tensor XV_batch,
+    const torch::Tensor XK_batch,
+    torch::Tensor output
+    // const torch::Tensor eta_batch
+)
+{
+    // Initalize data pointers
+    auto *d_q = reinterpret_cast<bf16*>(XQ_batch.data_ptr<at::BFloat16>());
+    auto *d_k = reinterpret_cast<bf16*>(XV_batch.data_ptr<at::BFloat16>());
+    auto *d_v = reinterpret_cast<bf16*>(XK_batch.data_ptr<at::BFloat16>());
+    auto *d_w1 = reinterpret_cast<bf16*>(W1_init.data_ptr<at::BFloat16>());
+    auto *d_w2 = reinterpret_cast<bf16*>(W2_init.data_ptr<at::BFloat16>());
+    auto *d_o = reinterpret_cast<bf16*>(output.data_ptr<at::BFloat16>());
+
+    constexpr int BATCH_SIZE = 1;
+    constexpr int HEADS = 1;
+    constexpr int TP = 4;
+
+    constexpr int SEQ_LEN = 64; 
+    constexpr int HEAD_DIM = 64; 
+    constexpr int EXP_DIM = 256;
+    constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
+
+    using globals = fwd_globals<HEAD_DIM>;
+
+    globals::q_gl qg_arg{d_q, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    globals::k_gl kg_arg{d_k, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    globals::v_gl vg_arg{d_v, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    globals::o_gl og_arg{d_o, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+
+    globals::w1_gl w1g_arg{d_w1, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+    globals::w2_gl w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+
+    globals g{qg_arg, kg_arg, vg_arg, w1g_arg, w2g_arg, og_arg, SEQ_LEN};
+    
+    // Set shared memory to use max dynamic
+    unsigned long mem_size = kittens::MAX_SHARED_MEMORY; // need to launch two blocks if possible.
+    
+    cudaFuncSetAttribute(
+        fwd_attend_ker<HEAD_DIM>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        mem_size
+    );
+
+    dim3 grid(TP, BATCH_SIZE, HEADS);
+
+    cudaDeviceSynchronize();
+    fwd_attend_ker<HEAD_DIM><<<grid, BLOCK_SIZE, mem_size>>>(g);
+    cudaDeviceSynchronize();
+}
+#endif
 
 #include "harness.impl"
