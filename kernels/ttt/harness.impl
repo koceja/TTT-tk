@@ -1,0 +1,162 @@
+#include <iostream>
+#include <string>
+#include <fstream>
+
+constexpr int BATCH_SIZE = 1;
+constexpr int HEADS = 1;
+constexpr int TP = 4;
+
+constexpr int SEQ_LEN = 64; 
+constexpr int HEAD_DIM = 64; 
+constexpr int EXP_DIM = 256;
+constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
+
+constexpr int ITER = 10;
+
+#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
+inline void __cudaCheckError( const char *file, const int line ) {
+    cudaError err = cudaGetLastError();
+    if ( cudaSuccess != err )
+    {
+        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n",
+                 file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+    // More careful checking. However, this will affect performance.
+    // Comment away if needed.
+    err = cudaDeviceSynchronize();
+    if( cudaSuccess != err )
+    {
+        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n",
+                 file, line, cudaGetErrorString( err ) );
+        exit( -1 );
+    }
+}
+
+int main(int argc, char **argv) {
+    std::cout << "Entered main!" << std::endl;
+
+    constexpr int TOTAL_ELEMENTS     = BATCH_SIZE*HEADS*SEQ_LEN*HEAD_DIM;
+    constexpr int TOTAL_HS_ELEMENTS  = BATCH_SIZE*HEADS*EXP_DIM*HEAD_DIM;
+
+    float *q      = new float[TOTAL_ELEMENTS];
+    float *k      = new float[TOTAL_ELEMENTS];
+    float *v      = new float[TOTAL_ELEMENTS];
+    float *o  = new float[TOTAL_ELEMENTS];
+    
+    float *w1     = new float[TOTAL_HS_ELEMENTS];
+    float *w2     = new float[TOTAL_HS_ELEMENTS];
+
+    bf16  *q_bf = new bf16[TOTAL_ELEMENTS];
+    bf16  *k_bf = new bf16[TOTAL_ELEMENTS];
+    bf16  *v_bf = new bf16[TOTAL_ELEMENTS];
+    
+    bf16 *w1_bf = new bf16[TOTAL_HS_ELEMENTS];
+    bf16 *w2_bf = new bf16[TOTAL_HS_ELEMENTS];
+
+    std::ifstream infile(argv[1]);
+    std::cout << "Starting to enter!" << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS/BATCH_SIZE; i++) q[i] = i;
+    std::cout << "Finished initializing Q" << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS/BATCH_SIZE; i++) k[i] = i;
+    std::cout << "Finished initializing K" << std::endl;
+    for(int i = 0; i < TOTAL_ELEMENTS/BATCH_SIZE; i++) v[i] = i;
+    std::cout << "Finished initializing V" << std::endl;
+
+    for(int i = 0; i < TOTAL_HS_ELEMENTS/BATCH_SIZE; i++) w1[i] = i;
+    std::cout << "Finished initializing W1" << std::endl;
+    for(int i = 0; i < TOTAL_HS_ELEMENTS/BATCH_SIZE; i++) w2[i] = i;
+    std::cout << "Finished initializing W2" << std::endl;
+
+    // Duplicate into a batch of data
+    for (int i = 0; i < TOTAL_ELEMENTS; i++) {
+        q_bf[i] = __float2bfloat16(q[i % (TOTAL_ELEMENTS/BATCH_SIZE)]);
+        k_bf[i] = __float2bfloat16(k[i % (TOTAL_ELEMENTS/BATCH_SIZE)]);
+        v_bf[i] = __float2bfloat16(v[i % (TOTAL_ELEMENTS/BATCH_SIZE)]);
+    }
+    for (int i = 0; i < TOTAL_HS_ELEMENTS; i++) {
+        w1_bf[i] = __float2bfloat16(w1[i % (TOTAL_HS_ELEMENTS/BATCH_SIZE)]);
+        w2_bf[i] = __float2bfloat16(w2[i % (TOTAL_HS_ELEMENTS/BATCH_SIZE)]);
+    }
+
+    bf16 *d_q, *d_k, *d_v, *d_w1, *d_w2, *d_o;
+
+    cudaMalloc(&d_q, (TOTAL_ELEMENTS) * sizeof(bf16));
+    cudaMalloc(&d_k, (TOTAL_ELEMENTS) * sizeof(bf16));
+    cudaMalloc(&d_v, (TOTAL_ELEMENTS) * sizeof(bf16));
+    cudaMalloc(&d_o, (TOTAL_ELEMENTS) * sizeof(bf16));
+
+    cudaMalloc(&d_w1, (TOTAL_HS_ELEMENTS) * sizeof(bf16));
+    cudaMalloc(&d_w2, (TOTAL_HS_ELEMENTS) * sizeof(bf16));
+
+    cudaMemcpy(d_q, q_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, k_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_v, v_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+
+    cudaMemcpy(d_w1, w1_bf, TOTAL_HS_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w2, w2_bf, TOTAL_HS_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+
+    using q_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+    using k_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+    using v_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+    using o_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+
+    using w1_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+    using w2_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+
+    using q_global = gl<bf16,  -1, -1, -1, -1, q_tile>;
+    using k_global = gl<bf16,  -1, -1, -1, -1, k_tile>;
+    using v_global = gl<bf16,  -1, -1, -1, -1, v_tile>;
+    using o_global = gl<bf16,  -1, -1, -1, -1, o_tile>;
+
+    using w1_global = gl<bf16,  -1, -1, -1, -1, w1_tile>;
+    using w2_global = gl<bf16,  -1, -1, -1, -1, w2_tile>;
+
+    using globals      = fwd_globals<HEAD_DIM>;
+
+    q_global qg_arg{d_q, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    k_global kg_arg{d_k, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    v_global vg_arg{d_v, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    o_global og_arg{d_o, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+
+    w1_global w1g_arg{d_w1, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+    w2_global w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+
+    globals g{qg_arg, kg_arg, vg_arg, w1g_arg, w2g_arg, og_arg, SEQ_LEN};
+
+    std::cout << "Allocated and set memory on GPU!" << std::endl;
+    
+    unsigned long mem_size = kittens::MAX_SHARED_MEMORY; // need to launch two blocks if possible.
+    
+    cudaFuncSetAttribute(
+        fwd_attend_ker<HEAD_DIM>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        mem_size
+    );
+    std::cout << "Set max dynamic memory!" << std::endl;
+
+    dim3 grid(TP, BATCH_SIZE, HEADS);
+
+    cudaDeviceSynchronize();
+    std::cout << "Starting kernel" << std::endl;
+    const auto start = std::chrono::high_resolution_clock::now();
+    for(int i = 0; i < ITER; i++) {
+        fwd_attend_ker<HEAD_DIM><<<grid, BLOCK_SIZE, mem_size>>>(g);
+    }
+    cudaDeviceSynchronize();
+    const auto finish = std::chrono::high_resolution_clock::now();
+
+    CudaCheckError();
+    std::cout << "Finished kernel\n";
+    std::cout << "Average fwd execution time: " << std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count() / ITER << " us" << std::endl;
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+    cudaFree(d_v);
+    cudaFree(d_w1);
+    cudaFree(d_w2);
+
+    delete[] q, k, v, w1, w2;
+    delete[] q_bf, k_bf, v_bf, w1_bf, w2_bf;
+    return 0;
+}
