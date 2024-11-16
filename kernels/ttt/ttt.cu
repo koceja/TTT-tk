@@ -283,14 +283,21 @@ void ttt_mlp_forward_tp(
     auto *d_w2 = reinterpret_cast<bf16*>(W2_init.data_ptr<at::BFloat16>());
     auto *d_o = reinterpret_cast<bf16*>(output.data_ptr<at::BFloat16>());
 
-    constexpr int BATCH_SIZE = 1;
-    constexpr int HEADS = 1;
+    constexpr int BATCH_SIZE = 4;
+    constexpr int HEADS = 32;
     constexpr int TP = 4;
 
-    constexpr int SEQ_LEN = 64; 
+    constexpr int SEQ_LEN = 2048; 
     constexpr int HEAD_DIM = 64; 
     constexpr int EXP_DIM = 256;
     constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
+
+    // Check to make sure the kernel is being called with the right dimensions
+    TORCH_CHECK(XQ_batch.size(0) == BATCH_SIZE, "InputInput batch size does not match BATCH_SIZE.");
+    TORCH_CHECK(XQ_batch.size(1) == HEADS, "Input heads dimension does not match HEADS.");
+    TORCH_CHECK(XQ_batch.size(2) == SEQ_LEN, "Input sequence length does not match SEQ_LEN.");
+    TORCH_CHECK(XQ_batch.size(3) == HEAD_DIM, "Input head dimension does not match HEAD_DIM.");
+    TORCH_CHECK(W1_init.size(3) == EXP_DIM, "Expanded MLP dimension does not match EXP_DIM.");
 
     using globals = fwd_globals<HEAD_DIM>;
 
