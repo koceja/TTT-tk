@@ -4,14 +4,13 @@
 
 constexpr int BATCH_SIZE = 1;
 constexpr int HEADS = 1;
-constexpr int TP = 4;
 
 constexpr int SEQ_LEN = 64; 
 constexpr int HEAD_DIM = 64; 
 constexpr int EXP_DIM = 256;
 constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
 
-constexpr int ITER = 10;
+constexpr int ITER = 1;
 
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
 inline void __cudaCheckError( const char *file, const int line ) {
@@ -39,44 +38,25 @@ int main(int argc, char **argv) {
     constexpr int TOTAL_ELEMENTS     = BATCH_SIZE*HEADS*SEQ_LEN*HEAD_DIM;
     constexpr int TOTAL_HS_ELEMENTS  = BATCH_SIZE*HEADS*EXP_DIM*HEAD_DIM;
 
-    float *q      = new float[TOTAL_ELEMENTS];
-    float *k      = new float[TOTAL_ELEMENTS];
-    float *v      = new float[TOTAL_ELEMENTS];
-    float *o  = new float[TOTAL_ELEMENTS];
-    
-    float *w1     = new float[TOTAL_HS_ELEMENTS];
-    float *w2     = new float[TOTAL_HS_ELEMENTS];
+    bf16 *q_bf, *k_bf, *v_bf, *o_bf, *w1_bf, *w2_bf;
 
-    bf16  *q_bf = new bf16[TOTAL_ELEMENTS];
-    bf16  *k_bf = new bf16[TOTAL_ELEMENTS];
-    bf16  *v_bf = new bf16[TOTAL_ELEMENTS];
-    
-    bf16 *w1_bf = new bf16[TOTAL_HS_ELEMENTS];
-    bf16 *w2_bf = new bf16[TOTAL_HS_ELEMENTS];
+    q_bf = (bf16*)malloc(TOTAL_ELEMENTS * sizeof(bf16));
+    k_bf = (bf16*)malloc(TOTAL_ELEMENTS * sizeof(bf16));
+    v_bf = (bf16*)malloc(TOTAL_ELEMENTS * sizeof(bf16));
+    o_bf = (bf16*)malloc(TOTAL_ELEMENTS * sizeof(bf16));
 
-    std::ifstream infile(argv[1]);
-    std::cout << "Starting to enter!" << std::endl;
-    for(int i = 0; i < TOTAL_ELEMENTS/BATCH_SIZE; i++) q[i] = i;
-    std::cout << "Finished initializing Q" << std::endl;
-    for(int i = 0; i < TOTAL_ELEMENTS/BATCH_SIZE; i++) k[i] = i;
-    std::cout << "Finished initializing K" << std::endl;
-    for(int i = 0; i < TOTAL_ELEMENTS/BATCH_SIZE; i++) v[i] = i;
-    std::cout << "Finished initializing V" << std::endl;
+    w1_bf = (bf16*)malloc(TOTAL_HS_ELEMENTS * sizeof(bf16));
+    w2_bf = (bf16*)malloc(TOTAL_HS_ELEMENTS * sizeof(bf16));
 
-    for(int i = 0; i < TOTAL_HS_ELEMENTS/BATCH_SIZE; i++) w1[i] = i;
-    std::cout << "Finished initializing W1" << std::endl;
-    for(int i = 0; i < TOTAL_HS_ELEMENTS/BATCH_SIZE; i++) w2[i] = i;
-    std::cout << "Finished initializing W2" << std::endl;
-
-    // Duplicate into a batch of data
     for (int i = 0; i < TOTAL_ELEMENTS; i++) {
-        q_bf[i] = __float2bfloat16(q[i % (TOTAL_ELEMENTS/BATCH_SIZE)]);
-        k_bf[i] = __float2bfloat16(k[i % (TOTAL_ELEMENTS/BATCH_SIZE)]);
-        v_bf[i] = __float2bfloat16(v[i % (TOTAL_ELEMENTS/BATCH_SIZE)]);
+        q_bf[i] = __int2bfloat16_rn(i % 256);
+        k_bf[i] = __int2bfloat16_rn(i % 256);
+        v_bf[i] = __int2bfloat16_rn(i % 256);
+        o_bf[i] = __int2bfloat16_rn(0);
     }
     for (int i = 0; i < TOTAL_HS_ELEMENTS; i++) {
-        w1_bf[i] = __float2bfloat16(w1[i % (TOTAL_HS_ELEMENTS/BATCH_SIZE)]);
-        w2_bf[i] = __float2bfloat16(w2[i % (TOTAL_HS_ELEMENTS/BATCH_SIZE)]);
+        w1_bf[i] = __int2bfloat16_rn(i % 256);
+        w2_bf[i] = __int2bfloat16_rn(i % 256);
     }
 
     bf16 *d_q, *d_k, *d_v, *d_w1, *d_w2, *d_o;
@@ -119,10 +99,10 @@ int main(int argc, char **argv) {
     v_global vg_arg{d_v, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
     o_global og_arg{d_o, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
 
-    w1_global w1g_arg{d_w1, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+    w1_global w1g_arg{d_w1, BATCH_SIZE, HEADS, HEAD_DIM, EXP_DIM};
     w2_global w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
 
-    globals g{qg_arg, kg_arg, vg_arg, w1g_arg, w2g_arg, og_arg, SEQ_LEN};
+    globals g{qg_arg, kg_arg, vg_arg, og_arg, w1g_arg, w2g_arg, SEQ_LEN};
 
     std::cout << "Allocated and set memory on GPU!" << std::endl;
     
@@ -153,10 +133,10 @@ int main(int argc, char **argv) {
     cudaFree(d_q);
     cudaFree(d_k);
     cudaFree(d_v);
+    cudaFree(d_o);
     cudaFree(d_w1);
     cudaFree(d_w2);
 
-    delete[] q, k, v, w1, w2;
-    delete[] q_bf, k_bf, v_bf, w1_bf, w2_bf;
+    delete[] q_bf, k_bf, v_bf, o_bf, w1_bf, w2_bf;
     return 0;
 }

@@ -10,6 +10,7 @@ constexpr int CONSUMER_WARPGROUPS = (1);
 constexpr int PRODUCER_WARPGROUPS = (1); 
 constexpr int NUM_WARPGROUPS      = (CONSUMER_WARPGROUPS+PRODUCER_WARPGROUPS); 
 constexpr int NUM_WORKERS         = (NUM_WARPGROUPS*kittens::WARPGROUP_WARPS); 
+constexpr int TP                  = (4);
 
 using namespace kittens;
 namespace cg = cooperative_groups;
@@ -127,7 +128,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
         init_semaphore(compute_done, CONSUMER_WARPGROUPS, 0);
 
         tma::expect_bytes(w1_smem_arrived, sizeof(w1_tile));
-        tma::load_async(w1_smem, g.w1, {batch_idx, head_idx, tp_idx, 0}, w1_smem_arrived);
+        tma::load_async(w1_smem, g.w1, {batch_idx, head_idx, 0, tp_idx}, w1_smem_arrived);
 
         tma::expect_bytes(w2_smem_arrived, sizeof(w2_tile));
         tma::load_async(w2_smem, g.w2, {batch_idx, head_idx, tp_idx, 0}, w2_smem_arrived);
@@ -196,8 +197,8 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::mma_async_wait();
             warpgroup::store(z2_smem, cs_cs_fl_reg);
 
-            // Reduction over SM (TODO: Hard coded to 4 right now)
-            square_all_reduce<4>(z2_smem, rd_buffer_smem, tp_idx);
+            // Reduction over SM
+            square_all_reduce<TP>(z2_smem, rd_buffer_smem, tp_idx);
             if (warpgroup::laneid() == 0) arrive(reduction_done, 1);
 
             // Calculate (negative) grad_l_wrt_Z2 / grad_l_wrt_Z1
