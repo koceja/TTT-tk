@@ -114,7 +114,7 @@ __global__ void ttt_tp_forward_ker(
     __syncthreads();
 
     if (wg::groupid() == CONSUMER_WARPGROUPS) {
-        wg::producer_registers();
+        wg::decrease_registers<32>();
         tma::cluster::arrive_aligned();
         wait(minibatch_first_reduction_done, 0);
 
@@ -134,7 +134,7 @@ __global__ void ttt_tp_forward_ker(
             wait(minibatch_first_reduction_done, i%2);
         }
     } else {
-        wg::consumer_registers<CONSUMER_WARPGROUPS>();
+        warpgroup::increase_registers<120>();
         rt_fl<N/G, F*K/TP> cs_tp_reg;
         rt_fl<N/G, N> cs_cs_fl_reg;
         rt_bf<N/G, N> cs_cs_bf_reg;
@@ -144,13 +144,11 @@ __global__ void ttt_tp_forward_ker(
             wait(k_sem, i%2);
             if (i == 0) wait(w1_sem, 0);
             wg::mm_AB(cs_tp_reg, XK, W1);
-            wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(Z1, cs_tp_reg);
 
             if (i == 0) wait(w2_sem, 0);
             wg::mm_AB(cs_tp_reg, Z1, W2);
-            wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(Z2, cs_tp_reg);
 
@@ -163,7 +161,6 @@ __global__ void ttt_tp_forward_ker(
             wait(v_sem, i%2);
             wg::sub(grad_l_wrt_Z2, Z2, XV);
             wg::mm_ABt(cs_tp_reg, grad_l_wrt_Z2, W2);
-            wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(grad_l_wrt_Z1, cs_tp_reg);
 
@@ -171,27 +168,23 @@ __global__ void ttt_tp_forward_ker(
             wait(q_sem, i%2);
             wg::mm_ABt(cs_cs_fl_reg, XQ, XK);
             wg::mm_AB(cs_tp_reg, XQ, W1);
-            wg::mma_commit_group();
 
             // Compute Z1_bar using Z1_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
             make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
             wg::mma_AB(cs_tp_reg, cs_cs_bf_reg, grad_l_wrt_Z1);
-            wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(Z1_bar, cs_tp_reg);
 
             // Compute Attn2 and Z2_bar partial (on registers)
             wg::mm_ABt(cs_cs_fl_reg, Z1_bar, Z1);
             wg::mm_AB(cs_tp_reg, Z1_bar, W2);
-            wg::mma_commit_group();
             wg::mma_async_wait();
 
             // Compute Z2_bar using Z2_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
             make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
             wg::mma_AB(cs_tp_reg, cs_cs_bf_reg, grad_l_wrt_Z2);
-            wg::mma_commit_group();
             wg::mma_async_wait();
 
             // TODO: perhaps make Z2_bar share memory with Z1_bar. Move store_async_read_wait to immediately above wg::store(Z1_bar, ...)
@@ -205,13 +198,11 @@ __global__ void ttt_tp_forward_ker(
             // Update hidden states (TODO: Is there a more efficient way to do this?)
             wg::load(cs_cs_fl_reg, W1);
             wg::mma_AtB(cs_cs_fl_reg, XK, grad_l_wrt_Z1);
-            wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(W1, cs_cs_fl_reg);
 
             wg::load(cs_cs_fl_reg, W2);
             wg::mma_AtB(cs_cs_fl_reg, Z1, grad_l_wrt_Z2);
-            wg::mma_commit_group();
             wg::mma_async_wait();
             wg::store(W2, cs_cs_fl_reg);
 
