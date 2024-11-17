@@ -93,6 +93,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     using v_tile    =         st_bf<K::tile_height, K::tile_width>;
 
     using z1_tile   =         st_bf<K::tile_height, K::tile_width>;
+    using x2_tile   =         st_bf<K::tile_height, K::tile_width>;
     using z2_tile   =         st_bf<K::tile_height, K::tile_width>;
     using grad_z1_tile   =         st_bf<K::tile_height, K::tile_width>;
     using rd_buffer_tile   =         st_bf<K::tile_height, K::tile_width>;
@@ -108,6 +109,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     v_tile    (&v_smem)                    = al.allocate<v_tile>();
 
     z1_tile    (&z1_smem)                   = al.allocate<z1_tile>();
+    x2_tile    (&x2_smem)                   = al.allocate<x2_tile>();
     z2_tile    (&z2_smem)                   = al.allocate<z2_tile>();
     grad_z1_tile    (&grad_z1_smem)         = al.allocate<grad_z1_tile>();
     rd_buffer_tile    (&rd_buffer_smem)      = al.allocate<rd_buffer_tile>();
@@ -195,8 +197,10 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::mm_AB(cs_cs_fl_reg, k_smem, w1_smem);
             warpgroup::mma_async_wait();
             warpgroup::store(z1_smem, cs_cs_fl_reg);
+            gelu(cs_cs_fl_reg, cs_cs_fl_reg);
+            warpgroup::store(x2_smem, cs_cs_fl_reg);
 
-            warpgroup::mm_AB(cs_cs_fl_reg, z1_smem, w2_smem);
+            warpgroup::mm_AB(cs_cs_fl_reg, x2_smem, w2_smem);
             warpgroup::mma_async_wait();
             warpgroup::store(z2_smem, cs_cs_fl_reg);
 
@@ -210,6 +214,9 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::sub(z2_smem, z2_smem, v_smem); // grad_l_wrt_Z2 is stored into z2_smem
             warpgroup::mm_ABt(cs_cs_fl_reg, z2_smem, w2_smem);
             warpgroup::mma_async_wait();
+            warpgroup::load(cs_cs_2_fl_reg, z1_smem);
+            gelu_bwd(cs_cs_2_fl_reg, cs_cs_2_fl_reg);
+            mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_2_fl_reg);
             warpgroup::store(grad_z1_smem, cs_cs_fl_reg);
 
             // Compute Attn1 and Z1_bar partial (on registers)
@@ -222,10 +229,11 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
             warpgroup::mma_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, grad_z1_smem); // Z1_bar
             warpgroup::mma_async_wait();
+            gelu(cs_cs_2_fl_reg, cs_cs_2_fl_reg);
 
             // Compute Attn2 and Z2_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_2_fl_reg);
-            warpgroup::mm_ABt(cs_cs_fl_reg, cs_cs_bf_reg, z1_smem); // Attn2
+            warpgroup::mm_ABt(cs_cs_fl_reg, cs_cs_bf_reg, x2_smem); // Attn2
             warpgroup::mm_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, w2_smem); // Z2_bar partial
             warpgroup::mma_async_wait();
 
@@ -249,7 +257,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             warpgroup::store(w1_smem, cs_cs_fl_reg);
 
             warpgroup::load(cs_cs_fl_reg, w2_smem);
-            warpgroup::mma_AtB(cs_cs_fl_reg, z1_smem, z2_smem);
+            warpgroup::mma_AtB(cs_cs_fl_reg, x2_smem, z2_smem);
             warpgroup::mma_async_wait();
             warpgroup::store(w2_smem, cs_cs_fl_reg);
 

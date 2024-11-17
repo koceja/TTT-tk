@@ -506,11 +506,22 @@ __device__ static inline void gelu(T &dst, const T &src) {
  *
  * @tparam T Tile type.
  * @param dst[out] Destination tile where the result is stored.
- * @param src[in] Source tile to apply the gelu function on.
+ * @param src[in] Source tile to apply the gelu bwd function on.
  */
 template<ducks::rt::all T>
 __device__ static inline void gelu_bwd(T &dst, const T &src) {
     unary_map<base_ops::gelu_bwd, T>(dst, src);
+}
+/**
+ * @brief Gelu backward backward
+ *
+ * @tparam T Tile type.
+ * @param dst[out] Destination tile where the result is stored.
+ * @param src[in] Source tile to apply the gelu bwd bwd function on.
+ */
+template<ducks::rt::all T>
+__device__ static inline void gelu_bwd_bwd(T &dst, const T &src) {
+    unary_map<base_ops::gelu_bwd_bwd, T>(dst, src);
 }
 /**
  * @brief Copies the elements from one tile to another.
