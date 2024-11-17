@@ -9,11 +9,11 @@
 
 #define CUDA_ASSERT(cond, tidx) if (!(cond)) { if (tidx == -1 || threadIdx.x == tidx && tp_idx == 0) printf("Kernel assert failed: %s\n", #cond); return; }
 
-constexpr int CONSUMER_WARPGROUPS = (1); 
+constexpr int CONSUMER_WARPGROUPS = (4); 
 constexpr int PRODUCER_WARPGROUPS = (1); 
 constexpr int NUM_WARPGROUPS      = (CONSUMER_WARPGROUPS+PRODUCER_WARPGROUPS); 
 constexpr int NUM_WORKERS         = (NUM_WARPGROUPS*kittens::WARPGROUP_WARPS); 
-constexpr int TP                  = (4);
+constexpr int SM_TP                  = (1);
 
 using namespace kittens;
 namespace cg = cooperative_groups;
@@ -81,7 +81,7 @@ __device__ __forceinline__ void square_all_reduce(ST &tile, ST &tile_other, int 
 
 template<int D>
 __global__  __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
-__cluster_dims__(4)
+__cluster_dims__(SM_TP)
 void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     extern __shared__ int __shm[]; 
     tma_swizzle_allocator al((int*)&__shm[0]);
@@ -101,17 +101,17 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
     using w1_tile   =         st_bf<K::tile_height, K::tile_width>;
     using w2_tile   =         st_bf<K::tile_height, K::tile_width>;
 
-    w1_tile   (&w1_smem)                   = al.allocate<w1_tile>();
-    w2_tile   (&w2_smem)                   = al.allocate<w2_tile>();
+    w1_tile   (&w1_smem)[CONSUMER_WARPGROUPS]                   = al.allocate<w1_tile, CONSUMER_WARPGROUPS>();
+    w2_tile   (&w2_smem)[CONSUMER_WARPGROUPS]                   = al.allocate<w2_tile, CONSUMER_WARPGROUPS>();
 
     q_tile    (&q_smem)[K::stages]         = al.allocate<q_tile, K::stages>();
     k_tile    (&k_smem)[K::stages]         = al.allocate<k_tile, K::stages>();
     v_tile    (&v_smem)[K::stages]         = al.allocate<v_tile, K::stages>();
 
-    z1_tile   (&z1_smem)                   = al.allocate<z1_tile>();
-    z2_tile   (&z2_smem)                   = al.allocate<z2_tile>();
-    grad_z1_tile  (&grad_z1_smem)          = al.allocate<grad_z1_tile>();
-    rd_buffer_tile (&rd_buffer_smem)       = al.allocate<rd_buffer_tile>();
+    z1_tile   (&z1_smem)[CONSUMER_WARPGROUPS]                   = al.allocate<z1_tile, CONSUMER_WARPGROUPS>();
+    grad_z1_tile  (&grad_z1_smem)[CONSUMER_WARPGROUPS]          = al.allocate<grad_z1_tile, CONSUMER_WARPGROUPS>();
+
+    auto      (*z2_smem)                      = reinterpret_cast<z2_tile(*)>(v_smem);
 
     int batch_idx   = blockIdx.y;
     int head_idx    = blockIdx.z;
@@ -138,11 +138,13 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
             init_semaphore(compute_done[i], CONSUMER_WARPGROUPS, 0);
         }
 
-        tma::expect_bytes(w1_smem_arrived, sizeof(w1_tile));
-        tma::load_async(w1_smem, g.w1, {batch_idx, head_idx, 0, tp_idx}, w1_smem_arrived);
-
-        tma::expect_bytes(w2_smem_arrived, sizeof(w2_tile));
-        tma::load_async(w2_smem, g.w2, {batch_idx, head_idx, tp_idx, 0}, w2_smem_arrived);
+        // Load hidden states across consumer warpgroups
+        tma::expect_bytes(w1_smem_arrived, sizeof(w1_smem));
+        tma::expect_bytes(w2_smem_arrived, sizeof(w2_smem));
+        for (int wg = 0; wg < CONSUMER_WARPGROUPS; wg++) {
+            tma::load_async(w1_smem[wg], g.w1, {batch_idx, head_idx, 0, wg}, w1_smem_arrived);
+            tma::load_async(w2_smem[wg], g.w2, {batch_idx, head_idx, wg, 0}, w2_smem_arrived);
+        }
 
         // Preload 1 minibatch
         int4 tile_idx = {batch_idx, head_idx, 0, 0};
@@ -160,7 +162,7 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
     if(warpgroupid == NUM_WARPGROUPS-1) {
         warpgroup::decrease_registers<32>();    
-        tma::cluster::arrive_aligned();
+        // tma::cluster::arrive_aligned();
         
         int iters; 
         iters = n_minibatch - 1;
@@ -180,12 +182,12 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
                 // Wait on previous stage to finish computation
                 kittens::wait(compute_done[idx % K::stages], (idx/K::stages) % 2);
-                tma::cluster::arrive_aligned();
+                // tma::cluster::arrive_aligned();
             }
         }
     }
     else {
-        warpgroup::increase_registers<184>();
+        warpgroup::increase_registers<96>();
 
         rt_fl<16, K::tile_height> cs_cs_fl_reg;
         rt_fl<16, K::tile_height> cs_cs_2_fl_reg;
@@ -193,70 +195,71 @@ void fwd_attend_ker(const __grid_constant__ fwd_globals<D> g) {
 
         kittens::wait(w1_smem_arrived, 0);
         kittens::wait(w2_smem_arrived, 0);
-        
+
         for (auto idx = 0; idx < n_minibatch; idx++) {
             // Hidden State Forward
             kittens::wait(k_sem_arrived[idx % K::stages], (idx/K::stages) % 2);
 
-            warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], w1_smem);
+            warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], w1_smem[warpgroupid]);
             warpgroup::mma_async_wait();
-            warpgroup::store(z1_smem, cs_cs_fl_reg);
+            warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
 
-            warpgroup::mm_AB(cs_cs_fl_reg, z1_smem, w2_smem);
+            warpgroup::mm_AB(cs_cs_fl_reg, z1_smem[warpgroupid], w2_smem[warpgroupid]);
             warpgroup::mma_async_wait();
-            warpgroup::store(z2_smem, cs_cs_fl_reg);
 
-            // Reduction over SM
-            square_all_reduce<TP>(z2_smem, rd_buffer_smem, tp_idx);
-
-            // Calculate (negative) grad_l_wrt_Z2 / grad_l_wrt_Z1
+            // Reduction over WG / SM
             // We use negative gradients to use the WGMMA accumulator
+            // TODO: Atomic across warpgroups and wait across warpgroups
             kittens::wait(v_sem_arrived[idx % K::stages], (idx/K::stages) % 2);
-            warpgroup::sub(z2_smem, z2_smem, v_smem[idx % K::stages]); // grad_l_wrt_Z2 is stored into z2_smem
-            warpgroup::mm_ABt(cs_cs_fl_reg, z2_smem, w2_smem);
-            warpgroup::mma_async_wait();
-            warpgroup::store(grad_z1_smem, cs_cs_fl_reg);
+            // square_all_reduce<TP>(z2_smem, rd_buffer_smem, tp_idx);
 
             // Compute Attn1 and Z1_bar partial (on registers)
             kittens::wait(q_sem_arrived[idx % K::stages], (idx/K::stages) % 2);
             warpgroup::mm_ABt(cs_cs_fl_reg, q_smem[idx % K::stages], k_smem[idx % K::stages]);
-            warpgroup::mm_AB(cs_cs_2_fl_reg, q_smem[idx % K::stages], w1_smem); // Z1_bar partial
-            
+            warpgroup::mm_AB(cs_cs_2_fl_reg, q_smem[idx % K::stages], w1_smem[warpgroupid]); // Z1_bar partial
+
+            // Wait for z2_smem atomic
+
+            // Calculate grad_l_wrt_Z1
+            warpgroup::mm_ABt(cs_cs_fl_reg, z2_smem[idx % K::stages], w2_smem[warpgroupid]); // TODO: Double check that this can be done
+            warpgroup::mma_async_wait();
+            warpgroup::store(grad_z1_smem[warpgroupid], cs_cs_fl_reg);
+
             // Compute Z1_bar using Z1_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
             make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
-            warpgroup::mma_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, grad_z1_smem); // Z1_bar
+            warpgroup::mma_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, grad_z1_smem[warpgroupid]); // Z1_bar
             warpgroup::mma_async_wait();
 
             // Compute Attn2 and Z2_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_2_fl_reg);
-            warpgroup::mm_ABt(cs_cs_fl_reg, cs_cs_bf_reg, z1_smem); // Attn2
-            warpgroup::mm_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, w2_smem); // Z2_bar partial
+            warpgroup::mm_ABt(cs_cs_fl_reg, cs_cs_bf_reg, z1_smem[warpgroupid]); // Attn2
+            warpgroup::mm_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, w2_smem[warpgroupid]); // Z2_bar partial
             warpgroup::mma_async_wait();
 
             // Compute Z2_bar using Z2_bar partial (on registers)
             copy(cs_cs_bf_reg, cs_cs_fl_reg);
             make_causal(cs_cs_bf_reg, cs_cs_bf_reg, base_types::constants<bf16>::zero());
-            warpgroup::mma_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, z2_smem); // Z2_bar
+            warpgroup::mma_AB(cs_cs_2_fl_reg, cs_cs_bf_reg, z2_smem[idx % K::stages]); // Z2_bar
             warpgroup::mma_async_wait();
-
-            // Store Z2_bar into global memory
-            warpgroup::store(z2_smem, cs_cs_2_fl_reg);
-            if (warpgroup::warpid() == 0) {
-                tma::store_add_async(g.o, z2_smem, {batch_idx, head_idx, idx, 0});
-                tma::store_commit_group();
-            }
 
             // Update hidden states
-            warpgroup::load(cs_cs_fl_reg, w1_smem);
-            warpgroup::mma_AtB(cs_cs_fl_reg, k_smem[idx % K::stages], grad_z1_smem);
+            warpgroup::load(cs_cs_fl_reg, w1_smem[warpgroupid]);
+            warpgroup::mma_AtB(cs_cs_fl_reg, k_smem[idx % K::stages], grad_z1_smem[warpgroupid]);
             warpgroup::mma_async_wait();
-            warpgroup::store(w1_smem, cs_cs_fl_reg);
+            warpgroup::store(w1_smem[warpgroupid], cs_cs_fl_reg);
 
-            warpgroup::load(cs_cs_fl_reg, w2_smem);
-            warpgroup::mma_AtB(cs_cs_fl_reg, z1_smem, z2_smem);
+            warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
+            warpgroup::mma_AtB(cs_cs_fl_reg, z1_smem[warpgroupid], z2_smem[idx % K::stages]);
             warpgroup::mma_async_wait();
-            warpgroup::store(w2_smem, cs_cs_fl_reg);
+            warpgroup::store(w2_smem[warpgroupid], cs_cs_fl_reg);
+
+            // Store Z2_bar into global memory
+            warpgroup::store(z2_smem[idx % K::stages], cs_cs_2_fl_reg); // TODO: Make this atomic across warpgroups
+            if (warpgroup::warpid() == 0) {
+                tma::store_add_async(g.o, z2_smem[idx % K::stages], {batch_idx, head_idx, idx, 0});
+                tma::store_commit_group();
+            }
 
             if (warpgroup::laneid() == 0) arrive(compute_done[idx % K::stages], 1);
         }
