@@ -10,7 +10,7 @@ constexpr int HEAD_DIM = 64;
 constexpr int EXP_DIM = 256;
 constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
 
-constexpr int ITER = 1;
+constexpr int ITER = 10;
 
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
 inline void __cudaCheckError( const char *file, const int line ) {
