@@ -5,11 +5,13 @@
 constexpr int BATCH_SIZE = 4;
 constexpr int HEADS = 32;
 
-constexpr int SEQ_LEN = 2048; 
+constexpr int SEQ_LEN = 8192; 
+constexpr int REMAT_GS = SEQ_LEN;
+constexpr int NUM_CHECKPOINTS = SEQ_LEN / REMAT_GS;
+
 constexpr int HEAD_DIM = 64; 
 constexpr int EXP_DIM = 256;
 constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
-constexpr int NUM_CHECKPOINTS = 512;
 
 constexpr int ITER = 10;
 
@@ -36,9 +38,9 @@ inline void __cudaCheckError( const char *file, const int line ) {
 int main(int argc, char **argv) {
     std::cout << "Entered main!" << std::endl;
 
-    constexpr int TOTAL_ELEMENTS     = BATCH_SIZE*HEADS*SEQ_LEN*HEAD_DIM;
-    constexpr int TOTAL_HS_ELEMENTS  = BATCH_SIZE*HEADS*EXP_DIM*HEAD_DIM;
-    constexpr int TOTAL_CHECKPOINT_ELEMENTS  = BATCH_SIZE*HEADS*NUM_CHECKPOINTS*EXP_DIM*HEAD_DIM;
+    constexpr int TOTAL_ELEMENTS = BATCH_SIZE*HEADS*SEQ_LEN*HEAD_DIM;
+    constexpr int TOTAL_HS_ELEMENTS = BATCH_SIZE*HEADS*EXP_DIM*HEAD_DIM;
+    constexpr int TOTAL_CHECKPOINT_ELEMENTS = BATCH_SIZE*HEADS*NUM_CHECKPOINTS*EXP_DIM*HEAD_DIM;
 
     bf16 *q_bf, *k_bf, *v_bf, *o_bf, *w1_bf, *w2_bf, *w1_checkpoints_bf, *w2_checkpoints_bf;
 
@@ -63,6 +65,10 @@ int main(int argc, char **argv) {
         w1_bf[i] = __int2bfloat16_rn(i % 256);
         w2_bf[i] = __int2bfloat16_rn(i % 256);
     }
+    for (int i = 0; i < TOTAL_CHECKPOINT_ELEMENTS; i++) {
+        w1_checkpoints_bf[i] = __int2bfloat16_rn(0);
+        w2_checkpoints_bf[i] = __int2bfloat16_rn(0);
+    }
 
     bf16 *d_q, *d_k, *d_v, *d_w1, *d_w2, *d_o, *d_w1_checkpoints, *d_w2_checkpoints;
 
@@ -74,8 +80,8 @@ int main(int argc, char **argv) {
     cudaMalloc(&d_w1, (TOTAL_HS_ELEMENTS) * sizeof(bf16));
     cudaMalloc(&d_w2, (TOTAL_HS_ELEMENTS) * sizeof(bf16));
 
-    cudaMalloc(&d_w1_checkpoints, (TOTAL_HS_ELEMENTS) * sizeof(bf16));
-    cudaMalloc(&d_w2_checkpoints, (TOTAL_HS_ELEMENTS) * sizeof(bf16));
+    cudaMalloc(&d_w1_checkpoints, (TOTAL_CHECKPOINT_ELEMENTS) * sizeof(bf16));
+    cudaMalloc(&d_w2_checkpoints, (TOTAL_CHECKPOINT_ELEMENTS) * sizeof(bf16));
 
     cudaMemcpy(d_q, q_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_k, k_bf, TOTAL_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
@@ -84,37 +90,34 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_w1, w1_bf, TOTAL_HS_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_w2, w2_bf, TOTAL_HS_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
 
-    using q_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
-    using k_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
-    using v_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
-    using o_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+    cudaMemcpy(d_w1_checkpoints, w1_checkpoints_bf, TOTAL_CHECKPOINT_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w2_checkpoints, w2_checkpoints_bf, TOTAL_CHECKPOINT_ELEMENTS * sizeof(bf16), cudaMemcpyHostToDevice);
 
-    using w1_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
-    using w2_tile    =         st_bf<fwd_attend_ker_tile_dims<HEAD_DIM>::tile_height, fwd_attend_ker_tile_dims<HEAD_DIM>::tile_width>;
+    using tile_type = st_bf<fwd_ttt_mlp_ker_tile_dims<HEAD_DIM>::tile_height, fwd_ttt_mlp_ker_tile_dims<HEAD_DIM>::tile_width>;
 
-    using q_global = gl<bf16,  -1, -1, -1, -1, q_tile>;
-    using k_global = gl<bf16,  -1, -1, -1, -1, k_tile>;
-    using v_global = gl<bf16,  -1, -1, -1, -1, v_tile>;
-    using o_global = gl<bf16,  -1, -1, -1, -1, o_tile>;
+    using q_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
+    using k_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
+    using v_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
+    using o_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
 
-    using w1_global = gl<bf16,  -1, -1, -1, -1, w1_tile>;
-    using w2_global = gl<bf16,  -1, -1, -1, -1, w2_tile>;
+    using w1_init_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
+    using w2_init_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
 
-    using w1_checkpoints_gl = gl<bf16, -1, -1, -1, -1, w1_tile>;
-    using w2_checkpoints_gl = gl<bf16, -1, -1, -1, -1, w2_tile>;
+    using w1_checkpoints_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
+    using w2_checkpoints_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
 
-    using globals      = fwd_globals<HEAD_DIM>;
+    using globals = fwd_globals<HEAD_DIM>;
 
-    q_global qg_arg{d_q, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
-    k_global kg_arg{d_k, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
-    v_global vg_arg{d_v, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
-    o_global og_arg{d_o, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    q_gl qg_arg{d_q, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    k_gl kg_arg{d_k, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    v_gl vg_arg{d_v, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
+    o_gl og_arg{d_o, BATCH_SIZE, HEADS, SEQ_LEN, HEAD_DIM};
 
-    w1_global w1g_arg{d_w1, BATCH_SIZE, HEADS, HEAD_DIM, EXP_DIM};
-    w2_global w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
+    w1_init_gl w1g_arg{d_w1, BATCH_SIZE, HEADS, HEAD_DIM, EXP_DIM};
+    w2_init_gl w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
 
-    globals::w1_gl w1_checkpoints_g_arg{d_w1_checkpoints, BATCH_SIZE*HEADS, NUM_CHECKPOINTS, HEAD_DIM, EXP_DIM};
-    globals::w2_gl w2_checkpoints_g_arg{d_w2_checkpoints, BATCH_SIZE*HEADS, NUM_CHECKPOINTS, EXP_DIM, HEAD_DIM};
+    w1_checkpoints_gl w1_checkpoints_g_arg{d_w1_checkpoints, BATCH_SIZE, HEADS, NUM_CHECKPOINTS*HEAD_DIM, EXP_DIM};
+    w2_checkpoints_gl w2_checkpoints_g_arg{d_w2_checkpoints, BATCH_SIZE, HEADS, EXP_DIM, NUM_CHECKPOINTS*HEAD_DIM};
 
     globals g{
         qg_arg, 
@@ -126,27 +129,27 @@ int main(int argc, char **argv) {
         w1_checkpoints_g_arg, 
         w2_checkpoints_g_arg, 
         SEQ_LEN,
-        HEADS,
-        NUM_CHECKPOINTS};
+        REMAT_GS
+    };
 
     std::cout << "Allocated and set memory on GPU!" << std::endl;
     
     unsigned long mem_size = kittens::MAX_SHARED_MEMORY; // need to launch two blocks if possible.
     
     cudaFuncSetAttribute(
-        fwd_attend_ker<HEAD_DIM>,
+        fwd_ttt_mlp_ker<HEAD_DIM>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         mem_size
     );
     std::cout << "Set max dynamic memory!" << std::endl;
 
-    dim3 grid(SM_TP, BATCH_SIZE, HEADS);
+    dim3 grid(BATCH_SIZE, HEADS);
 
     cudaDeviceSynchronize();
     std::cout << "Starting kernel" << std::endl;
     const auto start = std::chrono::high_resolution_clock::now();
     for(int i = 0; i < ITER; i++) {
-        fwd_attend_ker<HEAD_DIM><<<grid, BLOCK_SIZE, mem_size>>>(g);
+        fwd_ttt_mlp_ker<HEAD_DIM><<<grid, BLOCK_SIZE, mem_size>>>(g);
     }
     cudaDeviceSynchronize();
     const auto finish = std::chrono::high_resolution_clock::now();
