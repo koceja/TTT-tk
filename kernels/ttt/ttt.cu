@@ -135,6 +135,7 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
         using v_tile = st_bf<K::tile_height, K::tile_width>;
 
         using z1_tile = st_bf<K::tile_height, K::tile_width>;
+        using x2_tile = st_bf<K::tile_height, K::tile_width>;
         using z2_tile = st_bf<K::tile_height, K::tile_width>;
         using grad_z1_tile = st_bf<K::tile_height, K::tile_width>;
         using temp_tile = st_bf<K::tile_height, K::tile_width>;
@@ -150,6 +151,7 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
         v_tile(&v_smem)[K::stages] = al.allocate<v_tile, K::stages>();
 
         z1_tile(&z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<z1_tile, CONSUMER_WARPGROUPS>();
+        x2_tile(&x2_smem)[CONSUMER_WARPGROUPS] = al.allocate<x2_tile, CONSUMER_WARPGROUPS>();
         grad_z1_tile(&grad_z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<grad_z1_tile, CONSUMER_WARPGROUPS>();
 
         temp_tile(&temp_smem)[CONSUMER_WARPGROUPS] = al.allocate<temp_tile, CONSUMER_WARPGROUPS>();
@@ -247,7 +249,10 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
                         warpgroup::mma_async_wait();
                         warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
 
-                        warpgroup::mm_AB(cs_cs_fl_reg, z1_smem[warpgroupid], w2_smem[warpgroupid]);
+                        gelu(cs_cs_fl_reg, cs_cs_fl_reg);
+                        warpgroup::store(x2_smem[warpgroupid], cs_cs_fl_reg);
+
+                        warpgroup::mm_AB(cs_cs_fl_reg, x2_smem[warpgroupid], w2_smem[warpgroupid]);
                         warpgroup::mma_async_wait();
 
                         // Reduction over WG / SM
@@ -265,6 +270,9 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
                         // Calculate grad_l_wrt_Z1
                         warpgroup::mm_ABt(cs_cs_fl_reg, z2_smem[idx % K::stages], w2_smem[warpgroupid]);
                         warpgroup::mma_async_wait();
+                        warpgroup::load(cs_cs_2_fl_reg, z1_smem[warpgroupid]);
+                        gelu_bwd(cs_cs_2_fl_reg, cs_cs_2_fl_reg);
+                        mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_2_fl_reg);
                         warpgroup::store(grad_z1_smem[warpgroupid],
                                          cs_cs_fl_reg); // grad_z1_smem --> grad_l_wrt_Z1
 
@@ -272,7 +280,7 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
                         kittens::wait(q_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
                         warpgroup::mm_ABt(cs_cs_fl_reg, q_smem[idx % K::stages], k_smem[idx % K::stages]);
                         warpgroup::mma_async_wait();
-                        make_causal(cs_cs_fl_reg, cs_cs_fl_reg, base_types::constants<bf16>::zero());
+                        make_causal(cs_cs_fl_reg, cs_cs_fl_reg, base_types::constants<float>::zero());
                         warpgroup::store(temp_smem[warpgroupid],
                                          cs_cs_fl_reg); // temp_smem --> Attn1
 
@@ -280,13 +288,14 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
                         warpgroup::mm_AB(cs_cs_fl_reg, q_smem[idx % K::stages], w1_smem[warpgroupid]);
                         warpgroup::mma_AB(cs_cs_fl_reg, temp_smem[warpgroupid], grad_z1_smem[warpgroupid]);
                         warpgroup::mma_async_wait();
+                        gelu(cs_cs_fl_reg, cs_cs_fl_reg);
                         warpgroup::store(z1_bar_smem[idx % K::stages],
                                          cs_cs_fl_reg); // z1_bar_smem --> Z1_bar
 
                         // Compute Attn2
-                        warpgroup::mm_ABt(cs_cs_fl_reg, temp_smem[warpgroupid], z1_smem[warpgroupid]);
+                        warpgroup::mm_ABt(cs_cs_fl_reg, temp_smem[warpgroupid], x2_smem[warpgroupid]);
                         warpgroup::mma_async_wait();
-                        make_causal(cs_cs_fl_reg, cs_cs_fl_reg, base_types::constants<bf16>::zero());
+                        make_causal(cs_cs_fl_reg, cs_cs_fl_reg, base_types::constants<float>::zero());
                         warpgroup::store(temp_smem[warpgroupid],
                                          cs_cs_fl_reg); // temp_smem --> Attn2
 
@@ -312,7 +321,7 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
                         warpgroup::store(w1_smem[warpgroupid], cs_cs_fl_reg);
 
                         warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
-                        warpgroup::mma_AtB(cs_cs_fl_reg, z1_smem[warpgroupid], z2_smem[idx % K::stages]);
+                        warpgroup::mma_AtB(cs_cs_fl_reg, x2_smem[warpgroupid], z2_smem[idx % K::stages]);
                         warpgroup::mma_async_wait();
                         warpgroup::store(w2_smem[warpgroupid], cs_cs_fl_reg);
 

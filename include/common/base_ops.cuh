@@ -286,7 +286,6 @@ template<> __device__ inline half_2 div::op<half_2>(const half_2 &a, const half_
  *
  * @tparam T The data type of the input and output values.
  * @param a[in] The first input value.
- * @param b[in] The second input value.
  * @return The quotient of the input values.
  */
 struct sqrt {
@@ -299,6 +298,255 @@ template<> __device__ inline bf16_2 sqrt::op<bf16_2>(const bf16_2 &x) { return h
 // @Xinhao: add half and half_2
 template<> __device__ inline half   sqrt::op<half>  (const half &x  ) { return hsqrt(x);    }
 template<> __device__ inline half_2 sqrt::op<half_2>(const half_2 &x) { return h2sqrt(x); }
+
+namespace gelu_helpers
+{
+    template <typename T>
+    struct Constants;
+
+    template <>
+    struct Constants<float>
+    {
+        static constexpr float sqrt_2_over_pi = 0.79788456f;
+        static constexpr float coeff1 = 0.044715f;
+        static constexpr float coeff2 = 1.0f;
+        static constexpr float coeff3 = 2.0f;
+        static constexpr float coeff4 = -2.0f;
+        static constexpr float coeff5 = 0.5f;
+        static constexpr float coeff6 = 0.1070322243f;
+        static constexpr float coeff7 = 3.0f;
+    };
+
+    template <>
+    struct Constants<float2>
+    {
+        static __device__ inline float2 sqrt_2_over_pi() {
+            return make_float2(0.79788456f, 0.79788456f);
+        }
+        static __device__ inline float2 coeff1() {
+            return make_float2(0.044715f, 0.044715f);
+        }
+        static __device__ inline float2 coeff2() {
+            return make_float2(1.0f, 1.0f);
+        }
+        static __device__ inline float2 coeff3() {
+            return make_float2(2.0f, 2.0f);
+        }
+        static __device__ inline float2 coeff4() {
+            return make_float2(-2.0f, -2.0f);
+        }
+        static __device__ inline float2 coeff5() {
+            return make_float2(0.5f, 0.5f);
+        }
+        static __device__ inline float2 coeff6() {
+            return make_float2(0.1070322243f, 0.1070322243f);
+        }
+        static __device__ inline float2 coeff7() {
+            return make_float2(3.0f, 3.0f);
+        }
+    };
+
+    template <>
+    struct Constants<__half>
+    {
+        static __device__ inline __half sqrt_2_over_pi() {
+            return __float2half(0.79788456f);
+        }
+        static __device__ inline __half coeff1() {
+            return __float2half(0.044715f);
+        }
+        static __device__ inline __half coeff2() {
+            return __float2half(1.0f);
+        }
+        static __device__ inline __half coeff3() {
+            return __float2half(2.0f);
+        }
+        static __device__ inline __half coeff4() {
+            return __float2half(-2.0f);
+        }
+        static __device__ inline __half coeff5() {
+            return __float2half(0.5f);
+        }
+        static __device__ inline __half coeff6() {
+            return __float2half(0.1070322243f);
+        }
+        static __device__ inline __half coeff7() {
+            return __float2half(3.0f);
+        }
+    };
+
+    template <>
+    struct Constants<__half2>
+    {
+        static __device__ inline __half2 sqrt_2_over_pi() {
+            return __float2half2_rn(0.79788456f);
+        }
+        static __device__ inline __half2 coeff1() {
+            return __float2half2_rn(0.044715f);
+        }
+        static __device__ inline __half2 coeff2() {
+            return __float2half2_rn(1.0f);
+        }
+        static __device__ inline __half2 coeff3() {
+            return __float2half2_rn(2.0f);
+        }
+        static __device__ inline __half2 coeff4() {
+            return __float2half2_rn(-2.0f);
+        }
+        static __device__ inline __half2 coeff5() {
+            return __float2half2_rn(0.5f);
+        }
+        static __device__ inline __half2 coeff6() {
+            return __float2half2_rn(0.1070322243f);
+        }
+        static __device__ inline __half2 coeff7() {
+            return __float2half2_rn(3.0f);
+        }
+    };
+
+    template <>
+    struct Constants<__nv_bfloat16>
+    {
+        static __device__ inline __nv_bfloat16 sqrt_2_over_pi() {
+            return __float2bfloat16(0.79788456f);
+        }
+        static __device__ inline __nv_bfloat16 coeff1() {
+            return __float2bfloat16(0.044715f);
+        }
+        static __device__ inline __nv_bfloat16 coeff2() {
+            return __float2bfloat16(1.0f);
+        }
+        static __device__ inline __nv_bfloat16 coeff3() {
+            return __float2bfloat16(2.0f);
+        }
+        static __device__ inline __nv_bfloat16 coeff4() {
+            return __float2bfloat16(-2.0f);
+        }
+        static __device__ inline __nv_bfloat16 coeff5() {
+            return __float2bfloat16(0.5f);
+        }
+        static __device__ inline __nv_bfloat16 coeff6() {
+            return __float2bfloat16(0.1070322243f);
+        }
+        static __device__ inline __nv_bfloat16 coeff7() {
+            return __float2bfloat16(3.0f);
+        }
+    };
+
+    template <>
+    struct Constants<__nv_bfloat162>
+    {
+        static __device__ inline __nv_bfloat162 sqrt_2_over_pi() {
+            return __floats2bfloat162_rn(0.79788456f, 0.79788456f);
+        }
+        static __device__ inline __nv_bfloat162 coeff1() {
+            return __floats2bfloat162_rn(0.044715f, 0.044715f);
+        }
+        static __device__ inline __nv_bfloat162 coeff2() {
+            return __floats2bfloat162_rn(1.0f, 1.0f);
+        }
+        static __device__ inline __nv_bfloat162 coeff3() {
+            return __floats2bfloat162_rn(2.0f, 2.0f);
+        }
+        static __device__ inline __nv_bfloat162 coeff4() {
+            return __floats2bfloat162_rn(-2.0f, -2.0f);
+        }
+        static __device__ inline __nv_bfloat162 coeff5() {
+            return __floats2bfloat162_rn(0.5f, 0.5f);
+        }
+        static __device__ inline __nv_bfloat162 coeff6() {
+            return __floats2bfloat162_rn(0.1070322243f, 0.1070322243f);
+        }
+        static __device__ inline __nv_bfloat162 coeff7() {
+            return __floats2bfloat162_rn(3.0f, 3.0f);
+        }
+    };
+
+    template <typename T>
+    static constexpr inline T gelu_helper(T x)
+    {
+        T sqrt_2_over_pi = Constants<T>::sqrt_2_over_pi();
+        T coeff1 = Constants<T>::coeff1(); // 0.044715
+        T coeff2 = Constants<T>::coeff2(); // 1.0
+        T coeff3 = Constants<T>::coeff3(); // 2.0
+        T coeff4 = Constants<T>::coeff4(); // -2.0
+        T coeff5 = Constants<T>::coeff5(); // 0.5
+
+        T coeff = mul::op(sqrt_2_over_pi, sum::op(x, mul::op(mul::op(coeff1, x), mul::op(x , x))));
+        T tanh_approximation = sub::op(div::op(coeff3, sum::op(coeff2, exp::op(  mul::op(coeff4, coeff)    ))), coeff2);
+
+        return mul::op(coeff5, mul::op(x, sum::op(coeff2, tanh_approximation)));
+    }
+
+    template <typename T>
+    static constexpr inline T gelu_bwd_helper(T x)
+    {
+        T sqrt_2_over_pi = Constants<T>::sqrt_2_over_pi(); 
+        T coeff1 = Constants<T>::coeff1(); // 0.044715
+        T coeff2 = Constants<T>::coeff2(); // 1.0
+        T coeff3 = Constants<T>::coeff3(); // 2.0
+        T coeff4 = Constants<T>::coeff4(); // -2.0
+        T coeff5 = Constants<T>::coeff5(); // 0.5
+        T coeff6 = Constants<T>::coeff6(); // 0.1070322243
+
+        T coeff = mul::op(sqrt_2_over_pi, mul::op(x, sum::op(coeff2, mul::op(coeff1, mul::op(x, x)))));
+
+        T tanh_out = sub::op( div::op(coeff3, sum::op(coeff2, exp::op(mul::op(coeff4, coeff))))     , coeff2);
+
+        // 0.5 * (1 + tanh_out)
+        T a = mul::op(coeff5, sum::op(coeff2, tanh_out));
+        // 0.5 * x * (1 - tanh_out^2)
+        T b = mul::op(coeff5, mul::op(x, sub::op(coeff2, mul::op(tanh_out, tanh_out))));
+        // sqrt_2_over_pi + 0.1070322243 * x^2
+        T c = sum::op(sqrt_2_over_pi, mul::op(coeff6, mul::op(x, x)));
+
+        return sum::op(a, mul::op(b, c));
+    }
+
+    template <typename T>
+    static constexpr inline T gelu_bwd_bwd_helper(T x)
+    {
+        T sqrt_2_over_pi = Constants<T>::sqrt_2_over_pi(); 
+        T coeff1 = Constants<T>::coeff1(); // 0.044715
+        T coeff2 = Constants<T>::coeff2(); // 1.0
+        T coeff3 = Constants<T>::coeff3(); // 2.0
+        T coeff4 = Constants<T>::coeff4(); // -2.0
+        T coeff5 = Constants<T>::coeff5(); // 0.5
+        T coeff6 = Constants<T>::coeff6(); // 0.1070322243
+        T coeff7 = Constants<T>::coeff7(); // 3.0
+        T coeff8 = mul::op(coeff3, coeff7); // 6.0
+
+        T coeff = mul::op(sqrt_2_over_pi, mul::op(x, sum::op(coeff2, mul::op(coeff1, mul::op(x, x)))));
+
+        T tanh_out = sub::op( div::op(coeff3, sum::op(coeff2, exp::op(mul::op(coeff4, coeff))))     , coeff2);
+
+        // 6 * sqrt_2_over_pi * 0.044715 * x * x
+        T term1 = mul::op(mul::op(coeff8, sqrt_2_over_pi), mul::op(coeff1, mul::op(x, x)));
+
+        // sqrt_2_over_pi + 3 * sqrt_2_over_pi * 0.044715 * x * x
+        T term2 = sum::op(sqrt_2_over_pi, mul::op(coeff7, mul::op(sqrt_2_over_pi, mul::op(coeff1, mul::op(x, x)))));
+
+        // x * tanh_out * (term2 * term2)
+        T term3 = mul::op(x, mul::op(tanh_out, mul::op(term2, term2)));
+
+        // (1 - tanh_out * tanh_out) * (sqrt_2_over_pi + term1 - term2)
+        return mul::op(sub::op(coeff2, mul::op(tanh_out, tanh_out)), sum::op(sqrt_2_over_pi, sub::op(term1, term2)));
+    }
+}
+
+
+struct gelu {
+    template<typename T> static __device__ inline T op(const T &a) { return gelu_helpers::gelu_helper(a); }
+};
+
+struct gelu_bwd {
+    template<typename T> static __device__ inline T op(const T &a) { return gelu_helpers::gelu_bwd_helper(a); }
+};
+
+struct gelu_bwd_bwd {
+    template<typename T> static __device__ inline T op(const T &a) { return gelu_helpers::gelu_bwd_bwd_helper(a); }
+};
+
 /**
  * @brief Maximum operation.
  *
