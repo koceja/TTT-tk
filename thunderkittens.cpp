@@ -79,8 +79,10 @@ extern void ttt_mlp_forward_tp(
     const torch::Tensor XQ_batch,
     const torch::Tensor XV_batch,
     const torch::Tensor XK_batch,
-    torch::Tensor output
+    torch::Tensor output,
     // const torch::Tensor eta_batch
+    torch::Tensor W1_checkpoints,
+    torch::Tensor W2_checkpoints
 );
 #endif
 

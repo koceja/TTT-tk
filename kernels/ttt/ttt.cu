@@ -47,6 +47,9 @@ template <int D> struct fwd_globals {
         using w1_gl = gl<bf16, -1, -1, -1, -1, w1_tile>;
         using w2_gl = gl<bf16, -1, -1, -1, -1, w2_tile>;
 
+        using w1_checkpoints_gl = gl<bf16, -1, -1, -1, -1, w1_tile>;
+        using w2_checkpoints_gl = gl<bf16, -1, -1, -1, -1, w2_tile>;
+
         q_gl q;
         k_gl k;
         v_gl v;
@@ -54,7 +57,12 @@ template <int D> struct fwd_globals {
         w1_gl w1;
         w2_gl w2;
 
+        w1_checkpoints_gl w1_checkpoints;
+        w2_checkpoints_gl w2_checkpoints;
+
         const int N;
+        const int num_heads;
+        const int num_checkpoints;
 };
 
 template <ducks::st::all ST, ducks::rt::all RT>
@@ -158,9 +166,11 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
         auto(*z1_bar_smem) = reinterpret_cast<z1_tile(*)>(q_smem);
         auto(*z2_smem) = reinterpret_cast<z2_tile(*)>(v_smem);
 
-        int batch_idx = blockIdx.y;
-        int head_idx = blockIdx.z;
-        int n_minibatch = g.N / (K::tile_height);
+        const int batch_idx = blockIdx.y;
+        const int head_idx = blockIdx.z;
+        const int n_minibatch = g.N / (K::tile_height);
+        const int num_heads = g.num_heads;
+        const int checkpoint_interval = n_minibatch / g.num_checkpoints;
 
         cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
         int tp_idx = cluster.block_rank();
@@ -242,6 +252,14 @@ __global__ __launch_bounds__((NUM_WORKERS)*kittens::WARP_THREADS, 1)
                 kittens::wait(w2_smem_arrived, 0);
 
                 for (auto idx = 0; idx < n_minibatch; idx++) {
+                        // Save hidden state checkpoints
+                        if (warpid == 0 && idx % checkpoint_interval == 0) {
+                                int4 current_checkpoint = {batch_idx * num_heads + head_idx, idx / checkpoint_interval, 0, 0};
+                                tma::store_add_async(g.w1_checkpoints, w1_smem[warpgroupid], current_checkpoint);
+                                tma::store_add_async(g.w2_checkpoints, w2_smem[warpgroupid], current_checkpoint);
+                                tma::store_commit_group();
+                        }
+
                         // Hidden State Forward
                         kittens::wait(k_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
 
@@ -341,7 +359,12 @@ void ttt_mlp_forward_tp(
     // const torch::Tensor b1_init,
     const torch::Tensor W2_init,
     // const torch::Tensor b2_init,
-    const torch::Tensor XQ_batch, const torch::Tensor XV_batch, const torch::Tensor XK_batch, torch::Tensor output
+    const torch::Tensor XQ_batch, 
+    const torch::Tensor XV_batch, 
+    const torch::Tensor XK_batch, 
+    torch::Tensor output,
+    torch::Tensor W1_checkpoints,
+    torch::Tensor W2_checkpoints
     // const torch::Tensor eta_batch
 ) {
         // Initalize data pointers
@@ -351,15 +374,19 @@ void ttt_mlp_forward_tp(
         auto *d_w1 = reinterpret_cast<bf16 *>(W1_init.data_ptr<at::BFloat16>());
         auto *d_w2 = reinterpret_cast<bf16 *>(W2_init.data_ptr<at::BFloat16>());
         auto *d_o = reinterpret_cast<bf16 *>(output.data_ptr<at::BFloat16>());
+        auto *d_w1_checkpoints = reinterpret_cast<bf16 *>(W1_checkpoints.data_ptr<at::BFloat16>());
+        auto *d_w2_checkpoints = reinterpret_cast<bf16 *>(W2_checkpoints.data_ptr<at::BFloat16>());
 
-        constexpr int BATCH_SIZE = 1;
-        constexpr int HEADS = 1;
+        constexpr int BATCH_SIZE = 4;
+        constexpr int HEADS = 32;
         constexpr int TP = 4;
 
-        constexpr int SEQ_LEN = 64;
+        constexpr int SEQ_LEN = 2048;
         constexpr int HEAD_DIM = 64;
         constexpr int EXP_DIM = 256;
         constexpr int BLOCK_SIZE = (NUM_WORKERS * 32); // Number of threads in a block
+
+        constexpr int NUM_CHECKPOINTS = 512;
 
         using globals = fwd_globals<HEAD_DIM>;
 
@@ -371,7 +398,21 @@ void ttt_mlp_forward_tp(
         globals::w1_gl w1g_arg{d_w1, BATCH_SIZE, HEADS, HEAD_DIM, EXP_DIM};
         globals::w2_gl w2g_arg{d_w2, BATCH_SIZE, HEADS, EXP_DIM, HEAD_DIM};
 
-        globals g{qg_arg, kg_arg, vg_arg, w1g_arg, w2g_arg, og_arg, SEQ_LEN};
+        globals::w1_gl w1_checkpoints_g_arg{d_w1_checkpoints, BATCH_SIZE*HEADS, NUM_CHECKPOINTS, HEAD_DIM, EXP_DIM};
+        globals::w2_gl w2_checkpoints_g_arg{d_w2_checkpoints, BATCH_SIZE*HEADS, NUM_CHECKPOINTS, EXP_DIM, HEAD_DIM};
+
+        globals g{
+                qg_arg, 
+                kg_arg, 
+                vg_arg, 
+                og_arg, 
+                w1g_arg, 
+                w2g_arg, 
+                w1_checkpoints_g_arg, 
+                w2_checkpoints_g_arg, 
+                SEQ_LEN,
+                HEADS,
+                NUM_CHECKPOINTS};
 
         // Set shared memory to use max dynamic
         unsigned long mem_size = kittens::MAX_SHARED_MEMORY; // need to launch two blocks if possible.
