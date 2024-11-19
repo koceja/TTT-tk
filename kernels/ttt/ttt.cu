@@ -224,7 +224,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 for (auto idx = 0; idx < n_minibatch; idx++) {
                         // Hidden state forward
                         kittens::wait(k_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
-                        warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], k_smem[warpgroupid]);
+                        warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], w1_smem[warpgroupid]);
                         warpgroup::mma_async_wait();
                         warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
                         gelu(cs_cs_fl_reg, cs_cs_fl_reg);
