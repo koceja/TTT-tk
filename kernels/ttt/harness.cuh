@@ -1,3 +1,5 @@
+#ifndef TORCH_COMPILE
+
 #include <iostream>
 #include <string>
 #include <fstream>
@@ -13,7 +15,7 @@ constexpr int HEAD_DIM = 64;
 constexpr int EXP_DIM = 256;
 constexpr int BLOCK_SIZE = (NUM_WORKERS*32); // Number of threads in a block
 
-constexpr int ITER = 10;
+constexpr int ITER = 1;
 
 #define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
 inline void __cudaCheckError( const char *file, const int line ) {
@@ -168,3 +170,5 @@ int main(int argc, char **argv) {
     delete[] q_bf, k_bf, v_bf, o_bf, w1_bf, w2_bf;
     return 0;
 }
+
+#endif
