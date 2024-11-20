@@ -268,8 +268,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Save hidden state checkpoint (W1)
             if (wg_warpid == 0 && (idx + 1) % n_remat_groups == 0) {
                 int4 curr_checkpoint = {batch_idx, head_idx, (idx + 1) / n_remat_groups, warpgroupid};
-                tma::store_add_async(g.w1_checkpoints, w1_smem[warpgroupid], curr_checkpoint);
-                tma::store_commit_group();
+                tma::store_async(g.w1_checkpoints, w1_smem[warpgroupid], curr_checkpoint);
             }
 
             // Compute Attn2
@@ -282,11 +281,12 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::mm_AB(cs_cs_fl_reg, x2_bar_smem[warpgroupid], w2_smem[warpgroupid]);
             warpgroup::mma_AB(cs_cs_fl_reg, attn2_smem[warpgroupid], grad_l_z2_smem[idx % K::stages]);
             warpgroup::mma_async_wait();
-            warpgroup_store_add(z2_bar_smem[idx % K::stages], cs_cs_fl_reg);
+            warpgroup::store(z2_bar_smem[warpgroupid], cs_cs_fl_reg);
 
-            // Wait for reduction to be complete
-            if (warpgroup::laneid() == 0) arrive(reduction2_done, 1);
-            kittens::wait(reduction2_done, idx % 2);
+            // Store out Z2 Bar
+            if (wg_warpid == 0) {
+                tma::store_add_async(g.o, z2_bar_smem[warpgroupid], {batch_idx, head_idx, idx, 0});
+            }
 
             // Update hidden state (W2)
             warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
@@ -297,13 +297,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Save hidden state checkpoint (W2)
             if (wg_warpid == 0 && (idx + 1) % n_remat_groups == 0) {
                 int4 curr_checkpoint = {batch_idx, head_idx, warpgroupid, (idx + 1) / n_remat_groups};
-                tma::store_add_async(g.w2_checkpoints, w2_smem[warpgroupid], curr_checkpoint);
-                tma::store_commit_group();
-            }
-
-            // Store out Z2 Bar
-            if (warpid == 0) {
-                tma::store_add_async(g.o, z2_bar_smem[idx % K::stages], {batch_idx, head_idx, idx, 0});
+                tma::store_async(g.w2_checkpoints, w2_smem[warpgroupid], curr_checkpoint);
                 tma::store_commit_group();
             }
 
