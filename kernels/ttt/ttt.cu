@@ -134,17 +134,16 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     tile_type(&v_smem)[K::stages] = al.allocate<tile_type, K::stages>();
     
     // Shared memory for intermediates
+    tile_type(&z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
     tile_type(&x2_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
     tile_type(&grad_l_z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
-    tile_type(&temp_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
+    tile_type(&attn1_smem)= al.allocate<tile_type>();
 
     // Reinterpretations for intermediates
-    auto(*z1_smem) = reinterpret_cast<tile_type(*)>(temp_smem);
     auto(*grad_l_z2_smem) = reinterpret_cast<tile_type(*)>(v_smem);
-    auto(*attn1_smem) = reinterpret_cast<tile_type(*)>(temp_smem);
-    auto(*x2_bar_smem) = reinterpret_cast<tile_type(*)>(grad_l_z1_smem);
-    auto(*attn2_smem) = reinterpret_cast<tile_type(*)>(x2_smem);
-    auto(*z2_bar_smem) = reinterpret_cast<tile_type(*)>(temp_smem);
+    auto(*x2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
+    auto(*attn2_smem) = reinterpret_cast<tile_type(*)>(grad_l_z1_smem);
+    auto(*z2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
 
     __shared__ kittens::semaphore 
         w1_arrived,
@@ -187,7 +186,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     }
     __syncthreads();
 
-    // First warp in last warpgroup is the consumer
+    // First warp in last warpgroup is the producer
     if (warpgroupid == NUM_WARPGROUPS - 1) {
         warpgroup::decrease_registers<32>();
 
@@ -231,22 +230,18 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             kittens::wait(v_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
             warpgroup_store_add(grad_l_z2_smem[idx % K::stages], cs_cs_fl_reg);
 
+            // Compute Attn1 on first warpgroup
+            if (warpgroupid == 0) {
+                kittens::wait(q_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
+                warpgroup::mm_ABt(cs_cs_fl_reg, q_smem[idx % K::stages], k_smem[idx % K::stages]);
+                warpgroup::mma_async_wait();
+                make_causal(cs_cs_fl_reg, cs_cs_fl_reg);
+                warpgroup::store(attn1_smem, cs_cs_fl_reg);
+            }
+
             // Wait for reduction to be complete
             if (warpgroup::laneid() == 0) arrive(reduction1_done, 1);
             kittens::wait(reduction1_done, idx % 2);
-
-            // Update hidden state (W2)
-            warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
-            warpgroup::mma_AtB(cs_cs_fl_reg, x2_smem[warpgroupid], grad_l_z2_smem[idx % K::stages]);
-            warpgroup::mma_async_wait();
-            warpgroup::store(w2_smem[warpgroupid], cs_cs_fl_reg);
-
-            // Save hidden state checkpoint (W2)
-            if (wg_warpid == 0 && (idx + 1) % n_remat_groups == 0) {
-                int4 curr_checkpoint = {batch_idx, head_idx, warpgroupid, (idx + 1) / n_remat_groups};
-                tma::store_add_async(g.w2_checkpoints, w2_smem[warpgroupid], curr_checkpoint);
-                tma::store_commit_group();
-            }
 
             // Calculate grad_l_wrt_Z1
             warpgroup::mm_ABt(cs_cs_fl_reg, grad_l_z2_smem[idx % K::stages], w2_smem[warpgroupid]);
@@ -257,12 +252,12 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
             mul(grad_l_z1_smem[warpgroupid], grad_l_z1_smem[warpgroupid], z1_smem[warpgroupid]);
 
-            // Compute Attn1
-            kittens::wait(q_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
-            warpgroup::mm_ABt(cs_cs_fl_reg, q_smem[idx % K::stages], k_smem[idx % K::stages]);
+            // Compute Z1_bar
+            warpgroup::mm_AB(cs_cs_fl_reg, q_smem[idx % K::stages], w1_smem[warpgroupid]);
+            warpgroup::mma_AB(cs_cs_fl_reg, attn1_smem, grad_l_z1_smem[warpgroupid]);
             warpgroup::mma_async_wait();
-            make_causal(cs_cs_fl_reg, cs_cs_fl_reg);
-            warpgroup::store(attn1_smem[warpgroupid], cs_cs_fl_reg);
+            gelu(cs_cs_fl_reg, cs_cs_fl_reg);
+            warpgroup::store(x2_bar_smem[warpgroupid], cs_cs_fl_reg);
 
             // Update hidden states (W1)
             warpgroup::load(cs_cs_fl_reg, w1_smem[warpgroupid]);
@@ -276,13 +271,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 tma::store_add_async(g.w1_checkpoints, w1_smem[warpgroupid], curr_checkpoint);
                 tma::store_commit_group();
             }
-
-            // Compute Z1_bar
-            warpgroup::mm_AB(cs_cs_fl_reg, q_smem[idx % K::stages], w1_smem[warpgroupid]);
-            warpgroup::mma_AB(cs_cs_fl_reg, attn1_smem[warpgroupid], grad_l_z1_smem[warpgroupid]);
-            warpgroup::mma_async_wait();
-            gelu(cs_cs_fl_reg, cs_cs_fl_reg);
-            warpgroup::store(x2_bar_smem[warpgroupid], cs_cs_fl_reg);
 
             // Compute Attn2
             warpgroup::mm_ABt(cs_cs_fl_reg, x2_bar_smem[warpgroupid], x2_smem[warpgroupid]);
@@ -299,6 +287,19 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Wait for reduction to be complete
             if (warpgroup::laneid() == 0) arrive(reduction2_done, 1);
             kittens::wait(reduction2_done, idx % 2);
+
+            // Update hidden state (W2)
+            warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
+            warpgroup::mma_AtB(cs_cs_fl_reg, x2_smem[warpgroupid], grad_l_z2_smem[idx % K::stages]);
+            warpgroup::mma_async_wait();
+            warpgroup::store(w2_smem[warpgroupid], cs_cs_fl_reg);
+
+            // Save hidden state checkpoint (W2)
+            if (wg_warpid == 0 && (idx + 1) % n_remat_groups == 0) {
+                int4 curr_checkpoint = {batch_idx, head_idx, warpgroupid, (idx + 1) / n_remat_groups};
+                tma::store_add_async(g.w2_checkpoints, w2_smem[warpgroupid], curr_checkpoint);
+                tma::store_commit_group();
+            }
 
             // Store out Z2 Bar
             if (warpid == 0) {
