@@ -148,8 +148,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     __shared__ kittens::semaphore 
         w1_arrived,
         w2_arrived,
-        reduction1_done,
-        reduction2_done,
+        reduction_done,
         q_sem_arrived[K::stages],
         k_sem_arrived[K::stages], 
         v_sem_arrived[K::stages],
@@ -158,8 +157,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     if (threadIdx.x == 0) {
         init_semaphore(w1_arrived, 0, 1);
         init_semaphore(w2_arrived, 0, 1);
-        init_semaphore(reduction1_done, CONSUMER_WARPGROUPS, 0);
-        init_semaphore(reduction2_done, CONSUMER_WARPGROUPS, 0);
+        init_semaphore(reduction_done, CONSUMER_WARPGROUPS, 0);
         for (int i = 0; i < K::stages; i++) {
             init_semaphore(q_sem_arrived[i], 0, 1);
             init_semaphore(k_sem_arrived[i], 0, 1);
@@ -240,8 +238,8 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             }
 
             // Wait for reduction to be complete
-            if (warpgroup::laneid() == 0) arrive(reduction1_done, 1);
-            kittens::wait(reduction1_done, idx % 2);
+            if (warpgroup::laneid() == 0) arrive(reduction_done, 1);
+            kittens::wait(reduction_done, idx % 2);
 
             // Calculate grad_l_wrt_Z1
             warpgroup::mm_ABt(cs_cs_fl_reg, grad_l_z2_smem[idx % K::stages], w2_smem[warpgroupid]);
@@ -250,7 +248,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::load(cs_cs_fl_reg, z1_smem[warpgroupid]);
             gelu_bwd(cs_cs_fl_reg, cs_cs_fl_reg);
             warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
-            mul(grad_l_z1_smem[warpgroupid], grad_l_z1_smem[warpgroupid], z1_smem[warpgroupid]);
+            warpgroup::mul(grad_l_z1_smem[warpgroupid], grad_l_z1_smem[warpgroupid], z1_smem[warpgroupid]);
 
             // Compute Z1_bar
             warpgroup::mm_AB(cs_cs_fl_reg, q_smem[idx % K::stages], w1_smem[warpgroupid]);
