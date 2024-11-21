@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <limits>
 #include "base_types.cuh"
+#include <bit>
 
 namespace kittens {
 
@@ -301,6 +302,18 @@ template<> __device__ inline half_2 sqrt::op<half_2>(const half_2 &x) { return h
 
 namespace gelu_helpers
 {
+    inline constexpr bf16 __constexpr_float2bfloat16(const float value) {
+        const uint32_t bits = std::bit_cast<uint32_t>(value);
+        const uint16_t upper = static_cast<uint16_t>(bits >> 16);
+        return std::bit_cast<bf16>(upper);
+    }
+    inline constexpr bf16_2 __constexpr_floats2bfloat16(const float value1, const float value2) {
+        return bf16_2{__constexpr_float2bfloat16(value1), __constexpr_float2bfloat16(value2)};
+    }
+    inline constexpr bf16_2 __constexpr_float2bfloat162(const float value) {
+        return __constexpr_floats2bfloat16(value, value);
+    }
+
     template <typename T>
     struct Constants;
 
@@ -407,58 +420,58 @@ namespace gelu_helpers
     template <>
     struct Constants<__nv_bfloat16>
     {
-        static __device__ inline __nv_bfloat16 sqrt_2_over_pi() {
-            return __float2bfloat16(0.79788456f);
+        static __device__ inline constexpr bf16 sqrt_2_over_pi() {
+            return __constexpr_float2bfloat16(0.79788456f);
         }
-        static __device__ inline __nv_bfloat16 coeff1() {
-            return __float2bfloat16(0.044715f);
+        static __device__ inline constexpr bf16 coeff1() {
+            return __constexpr_float2bfloat16(0.044715f);
         }
-        static __device__ inline __nv_bfloat16 coeff2() {
-            return __float2bfloat16(1.0f);
+        static __device__ inline constexpr bf16 coeff2() {
+            return __constexpr_float2bfloat16(1.0f);
         }
-        static __device__ inline __nv_bfloat16 coeff3() {
-            return __float2bfloat16(2.0f);
+        static __device__ inline constexpr bf16 coeff3() {
+            return __constexpr_float2bfloat16(2.0f);
         }
-        static __device__ inline __nv_bfloat16 coeff4() {
-            return __float2bfloat16(-2.0f);
+        static __device__ inline constexpr bf16 coeff4() {
+            return __constexpr_float2bfloat16(-2.0f);
         }
-        static __device__ inline __nv_bfloat16 coeff5() {
-            return __float2bfloat16(0.5f);
+        static __device__ inline constexpr bf16 coeff5() {
+            return __constexpr_float2bfloat16(0.5f);
         }
-        static __device__ inline __nv_bfloat16 coeff6() {
-            return __float2bfloat16(0.1070322243f);
+        static __device__ inline constexpr bf16 coeff6() {
+            return __constexpr_float2bfloat16(0.1070322243f);
         }
-        static __device__ inline __nv_bfloat16 coeff7() {
-            return __float2bfloat16(3.0f);
+        static __device__ inline constexpr bf16 coeff7() {
+            return __constexpr_float2bfloat16(3.0f);
         }
     };
 
     template <>
     struct Constants<__nv_bfloat162>
     {
-        static __device__ inline __nv_bfloat162 sqrt_2_over_pi() {
-            return __floats2bfloat162_rn(0.79788456f, 0.79788456f);
+        static __device__ inline constexpr bf16_2 sqrt_2_over_pi() {
+            return __constexpr_float2bfloat162(0.79788456f);
         }
-        static __device__ inline __nv_bfloat162 coeff1() {
-            return __floats2bfloat162_rn(0.044715f, 0.044715f);
+        static __device__ inline constexpr bf16_2 coeff1() {
+            return __constexpr_float2bfloat162(0.044715f);
         }
-        static __device__ inline __nv_bfloat162 coeff2() {
-            return __floats2bfloat162_rn(1.0f, 1.0f);
+        static __device__ inline constexpr bf16_2 coeff2() {
+            return __constexpr_float2bfloat162(1.0f);
         }
-        static __device__ inline __nv_bfloat162 coeff3() {
-            return __floats2bfloat162_rn(2.0f, 2.0f);
+        static __device__ inline constexpr bf16_2 coeff3() {
+            return __constexpr_float2bfloat162(2.0f);
         }
-        static __device__ inline __nv_bfloat162 coeff4() {
-            return __floats2bfloat162_rn(-2.0f, -2.0f);
+        static __device__ inline constexpr bf16_2 coeff4() {
+            return __constexpr_float2bfloat162(-2.0f);
         }
-        static __device__ inline __nv_bfloat162 coeff5() {
-            return __floats2bfloat162_rn(0.5f, 0.5f);
+        static __device__ inline constexpr bf16_2 coeff5() {
+            return __constexpr_float2bfloat162(0.5f);
         }
-        static __device__ inline __nv_bfloat162 coeff6() {
-            return __floats2bfloat162_rn(0.1070322243f, 0.1070322243f);
+        static __device__ inline constexpr bf16_2 coeff6() {
+            return __constexpr_float2bfloat162(0.1070322243f);
         }
-        static __device__ inline __nv_bfloat162 coeff7() {
-            return __floats2bfloat162_rn(3.0f, 3.0f);
+        static __device__ inline constexpr bf16_2 coeff7() {
+            return __constexpr_float2bfloat162(3.0f);
         }
     };
 
