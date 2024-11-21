@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
     );
     std::cout << "Set max dynamic memory!" << std::endl;
 
-    dim3 grid(BATCH_SIZE, HEADS);
+    dim3 grid(TP, BATCH_SIZE, HEADS);
 
     cudaDeviceSynchronize();
     std::cout << "Starting kernel" << std::endl;
