@@ -1,4 +1,5 @@
 import torch
+import thunderkittens
 
 def gelu_bwd(x):
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
@@ -145,47 +146,183 @@ def compute_mini_batch(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
 
     return Z2_bar, W1_next, b1_next, W2_next, b2_next
 
+
+def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
+    """
+    Mini batch forward for TTT MLP.
+
+    xq_mb: [CS, F]
+    xk_mb: [CS, F]
+    xv_mb: [CS, F]
+    W1: [F, K]
+    b1: [1, K]
+    W2: [K, F]
+    b2: [1, F]
+
+    Dimension Key:
+    B: Batch size
+    H: Num of heads
+    CS: Mini-batch size
+    F: Head dimension
+    K: Expansion dimension
+
+    Excludes:
+    - ILR
+    - LayerNorm
+    - Residual connection
+    """
+    # Inner model forward
+    Z1 = xk_mb @ W1 + b1
+    X2 = torch.nn.functional.gelu(Z1, approximate="tanh")
+    Z2 = X2 @ W2 + b2
+
+    # Gradient calculation
+    grad_l_wrt_Z2 = xv_mb - Z2
+    grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2.T * gelu_bwd(Z1)
+
+    # # Dual form
+    # Attn1 = torch.tril(xq_mb @ xk_mb.T)
+    # b1_bar = b1 - grad_l_wrt_Z1
+    # Z1_bar = xq_mb @ W1 - Attn1 @ grad_l_wrt_Z1 + b1_bar
+
+    # X2_bar = torch.nn.functional.gelu(Z1_bar, approximate="tanh")
+    
+    # Attn2 = torch.tril(X2_bar @ X2.T)
+    # b2_bar = b2 - grad_l_wrt_Z2
+    # Z2_bar = X2_bar @ W2 - Attn2 @ grad_l_wrt_Z2 + b2_bar
+
+    # Weight updates
+    W1_next = W1 - xk_mb.T @ grad_l_wrt_Z1
+    b1_next = b1 - grad_l_wrt_Z1.sum(dim=0, keepdim=True)
+
+    W2_next = W2 - X2_bar.T @ grad_l_wrt_Z2
+    b2_next = b2 - grad_l_wrt_Z2.sum(dim=0, keepdim=True)
+
+
+    Z1_bar = xq_mb @ W1_next + b1_next
+    X2_bar = torch.nn.functional.gelu(Z1_bar, approximate="tanh")
+    Z2_bar = X2_bar @ W2 + b2_next
+
+
+    return Z2_bar, W1_next, b1_next, W2_next, b2_next
+
+
+# def main():
+#     # Define shapes
+#     seq_len = 64
+#     mini_batch_size = 64
+#     head_dim = 64
+#     expansion_dim = 256
+#     shard_size = 4
+
+#     dtype = torch.float32
+#     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+#     # Create inputs
+#     xq = torch.randn(seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+#     xk = torch.randn(seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+#     xv = torch.randn(seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+
+#     W1_pt = torch.randn(head_dim, expansion_dim, dtype=dtype, device=device).contiguous()
+#     b1_pt = torch.randn(1, expansion_dim, dtype=dtype, device=device).contiguous()
+#     W2_pt = torch.randn(expansion_dim, head_dim, dtype=dtype, device=device).contiguous()
+#     b2_pt = torch.randn(1, head_dim, dtype=dtype, device=device).contiguous()
+
+#     # Create output buffers
+#     Z2_bar_pt = torch.zeros(seq_len, head_dim, dtype=dtype, device=device).contiguous()
+#     Z2_bar_pt_shard = torch.zeros(seq_len, head_dim, dtype=dtype, device=device).contiguous()
+
+#     # Compute mini-batches for PyTorch
+#     for i in range(seq_len // mini_batch_size):
+#         seq_idx = i * mini_batch_size
+
+#         xq_mb = xq[i]
+#         xk_mb = xk[i]
+#         xv_mb = xv[i]
+
+#         Z2_bar_pt_shard[seq_idx:seq_idx+mini_batch_size], _, _, _, _= compute_mini_batch_shard(W1_pt, b1_pt, W2_pt, b2_pt, xq_mb, xk_mb, xv_mb, shard_size)
+#         Z2_bar_pt[seq_idx:seq_idx+mini_batch_size], W1_pt, b1_pt, W2_pt, b2_pt = compute_mini_batch(W1_pt, b1_pt, W2_pt, b2_pt, xq_mb, xk_mb, xv_mb)
+
+#     # Compare outputs
+#     print("Comparing Outputs")
+#     print("PT Shape: ", Z2_bar_pt.shape)
+#     print("PT Shard Shape: ", Z2_bar_pt_shard.shape)
+#     compare_outputs(Z2_bar_pt, Z2_bar_pt_shard, "Z2_bar: Non-Sharded vs Sharded")
+
 def main():
     # Define shapes
-    seq_len = 64
+    B = 1
+    NH = 48
+    K = 1
+    seq_len = 128
     mini_batch_size = 64
     head_dim = 64
     expansion_dim = 256
     shard_size = 4
 
-    dtype = torch.float32
+    dtype = torch.bfloat16
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # Create inputs
-    xq = torch.randn(seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    xk = torch.randn(seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    xv = torch.randn(seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    xq = torch.randn(B, NH, seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    xk = torch.randn(B, NH, seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    xv = torch.randn(B, NH, seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
-    W1_pt = torch.randn(head_dim, expansion_dim, dtype=dtype, device=device).contiguous()
-    b1_pt = torch.randn(1, expansion_dim, dtype=dtype, device=device).contiguous()
-    W2_pt = torch.randn(expansion_dim, head_dim, dtype=dtype, device=device).contiguous()
-    b2_pt = torch.randn(1, head_dim, dtype=dtype, device=device).contiguous()
+    W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=dtype, device=device).contiguous()
+    b1 = torch.randn(B, NH, expansion_dim, dtype=dtype, device=device).contiguous()
+    W2 = torch.randn(B, NH, expansion_dim, head_dim, dtype=dtype, device=device).contiguous()
+    b2 = torch.randn(B, NH, head_dim, dtype=dtype, device=device).contiguous()
+
+
+    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=dtype, device=device).contiguous()
+    b1_checkpoints = torch.randn(B, NH, K, expansion_dim, dtype=dtype, device=device).contiguous()
+    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=dtype, device=device).contiguous()
+    b2_checkpoints = torch.randn(B, NH, K, head_dim, dtype=dtype, device=device).contiguous()
 
     # Create output buffers
-    Z2_bar_pt = torch.zeros(seq_len, head_dim, dtype=dtype, device=device).contiguous()
-    Z2_bar_pt_shard = torch.zeros(seq_len, head_dim, dtype=dtype, device=device).contiguous()
+    Z2_bar_pt = torch.zeros(B, NH, seq_len, head_dim, dtype=dtype, device=device).contiguous()
+    # Z2_bar_pt_shard = torch.zeros(seq_len, head_dim, dtype=dtype, device=device).contiguous()
+    output_tk = torch.zeros(B, NH, seq_len // mini_batch_size, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
-    # Compute mini-batches for PyTorch
-    for i in range(seq_len // mini_batch_size):
-        seq_idx = i * mini_batch_size
 
-        xq_mb = xq[i]
-        xk_mb = xk[i]
-        xv_mb = xv[i]
+    thunderkittens.ttt_forward(
+        xq,
+        xk,
+        xv,
+        W1,
+        b1,
+        W2,
+        b2,
+        W1_checkpoints,
+        b1_checkpoints,
+        W2_checkpoints,
+        b2_checkpoints,
+        output_tk
+    )
 
-        Z2_bar_pt_shard[seq_idx:seq_idx+mini_batch_size], _, _, _, _= compute_mini_batch_shard(W1_pt, b1_pt, W2_pt, b2_pt, xq_mb, xk_mb, xv_mb, shard_size)
-        Z2_bar_pt[seq_idx:seq_idx+mini_batch_size], W1_pt, b1_pt, W2_pt, b2_pt = compute_mini_batch(W1_pt, b1_pt, W2_pt, b2_pt, xq_mb, xk_mb, xv_mb)
+    breakpoint()
 
-    # Compare outputs
-    print("Comparing Outputs")
-    print("PT Shape: ", Z2_bar_pt.shape)
-    print("PT Shard Shape: ", Z2_bar_pt_shard.shape)
-    compare_outputs(Z2_bar_pt, Z2_bar_pt_shard, "Z2_bar: Non-Sharded vs Sharded")
+
+    # # Compute mini-batches for PyTorch
+    # for i in range(seq_len // mini_batch_size):
+    #     seq_idx = i * mini_batch_size
+
+    #     xq_mb = xq[i]
+    #     xk_mb = xk[i]
+    #     xv_mb = xv[i]
+
+    #     Z2_bar_pt_shard[seq_idx:seq_idx+mini_batch_size], _, _, _, _= compute_mini_batch_shard(W1_pt, b1_pt, W2_pt, b2_pt, xq_mb, xk_mb, xv_mb, shard_size)
+    #     Z2_bar_pt[seq_idx:seq_idx+mini_batch_size], W1_pt, b1_pt, W2_pt, b2_pt = compute_mini_batch(W1_pt, b1_pt, W2_pt, b2_pt, xq_mb, xk_mb, xv_mb)
+
+    # # Compare outputs
+    # print("Comparing Outputs")
+    # print("PT Shape: ", Z2_bar_pt.shape)
+    # print("PT Shard Shape: ", Z2_bar_pt_shard.shape)
+    # compare_outputs(Z2_bar_pt, Z2_bar_pt_shard, "Z2_bar: Non-Sharded vs Sharded")
+
+
+
+
 
 if __name__ == "__main__":
     main()

@@ -30,9 +30,13 @@ extern torch::Tensor ttt_forward(
     const torch::Tensor XK,
     const torch::Tensor XV,
     const torch::Tensor W1,
+    const torch::Tensor b1,
     const torch::Tensor W2,
+    const torch::Tensor b2,
     const torch::Tensor W1_checkpoints,
+    const torch::Tensor b1_checkpoints,
     const torch::Tensor W2_checkpoints,
+    const torch::Tensor b2_checkpoints,
     const torch::Tensor Out
 );
 #endif

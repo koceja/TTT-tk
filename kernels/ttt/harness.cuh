@@ -195,6 +195,7 @@ int main(int argc, char **argv) {
     const auto start = std::chrono::high_resolution_clock::now();
     for(int i = 0; i < ITER; i++) {
         fwd_ttt_mlp_ker<HEAD_DIM><<<grid, BLOCK_SIZE, mem_size>>>(g);
+        cudaDeviceSynchronize();
     }
     cudaDeviceSynchronize();
     const auto finish = std::chrono::high_resolution_clock::now();
