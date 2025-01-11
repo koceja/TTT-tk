@@ -7,9 +7,10 @@
 constexpr int BATCH_SIZE = 4;
 constexpr int HEADS = 32;
 
-constexpr int SEQ_LEN = 8192; 
-constexpr int REMAT_GS = SEQ_LEN;
-constexpr int NUM_CHECKPOINTS = SEQ_LEN / REMAT_GS;
+constexpr int SEQ_LEN = 32768; 
+constexpr int REMAT_GS = 32;
+constexpr int CS = 64;
+constexpr int NUM_CHECKPOINTS = SEQ_LEN / CS / REMAT_GS;
 
 constexpr int HEAD_DIM = 64; 
 constexpr int EXP_DIM = 256;
