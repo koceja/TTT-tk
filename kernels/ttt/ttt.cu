@@ -33,6 +33,8 @@ template <int head_dim> struct fwd_globals {
     using v_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
     using o_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
 
+    using last_eta_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
+
     using w1_init_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
     using b1_init_gl = gl<bf16, -1, -1, -1, -1, vec_type>;
     using w2_init_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
@@ -48,6 +50,9 @@ template <int head_dim> struct fwd_globals {
     k_gl k;
     v_gl v;
     o_gl o;
+
+    last_eta_gl last_eta;
+
     w1_init_gl w1;
     b1_init_gl b1;
     w2_init_gl w2;
@@ -104,6 +109,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     tile_type(&q_smem)[K::stages] = al.allocate<tile_type, K::stages>();
     tile_type(&k_smem)[K::stages] = al.allocate<tile_type, K::stages>();
     tile_type(&v_smem)[K::stages] = al.allocate<tile_type, K::stages>();
+    tile_type(&last_eta_smem)[K::stages] = al.allocate<tile_type, K::stages>();
     
     // Shared memory for intermediates
     tile_type(&z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
@@ -130,6 +136,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
         q_sem_arrived[K::stages],
         k_sem_arrived[K::stages], 
         v_sem_arrived[K::stages],
+        last_eta_sem_arrived[K::stages],
         compute_done[K::stages];
 
     if (threadIdx.x == 0) {
@@ -143,6 +150,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             init_semaphore(q_sem_arrived[i], 0, 1);
             init_semaphore(k_sem_arrived[i], 0, 1);
             init_semaphore(v_sem_arrived[i], 0, 1);
+            init_semaphore(last_eta_sem_arrived[i], 0, 1);
             init_semaphore(compute_done[i], CONSUMER_WARPGROUPS, 0);
         }
 
@@ -167,6 +175,8 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             tma::load_async(v_smem[j], g.v, tile_idx, v_sem_arrived[j]);
             tma::expect_bytes(q_sem_arrived[j], sizeof(tile_type));
             tma::load_async(q_smem[j], g.q, tile_idx, q_sem_arrived[j]);
+            tma::expect_bytes(last_eta_sem_arrived[j], sizeof(tile_type));
+            tma::load_async(last_eta_smem[j], g.last_eta, tile_idx, last_eta_sem_arrived[j]);
         }
     }
     __syncthreads();
@@ -189,6 +199,8 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 tma::load_async(v_smem[(idx + 1) % K::stages], g.v, tile_idx, v_sem_arrived[(idx + 1) % K::stages]);
                 tma::expect_bytes(q_sem_arrived[(idx + 1) % K::stages], sizeof(tile_type));
                 tma::load_async(q_smem[(idx + 1) % K::stages], g.q, tile_idx, q_sem_arrived[(idx + 1) % K::stages]);
+                tma::expect_bytes(last_eta_sem_arrived[(idx + 1) % K::stages], sizeof(tile_type));
+                tma::load_async(last_eta_smem[(idx + 1) % K::stages], g.last_eta, tile_idx, last_eta_sem_arrived[(idx + 1) % K::stages]);
 
                 // Wait on previous stage to finish computation
                 kittens::wait(compute_done[(idx+2) % K::stages], ((idx+2) / K::stages) % 2);
@@ -279,7 +291,16 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
             warpgroup::mul(grad_l_z1_smem[warpgroupid], grad_l_z1_smem[warpgroupid], z1_smem[warpgroupid]);
 
-            // Update hidden state (W2)
+            // Apply ilr to grads
+            kittens::wait(last_eta_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
+            warpgroup::mul(grad_l_z1_smem[warpgroupid], grad_l_z1_smem[warpgroupid], last_eta_smem[idx % K::stages]); // z1 first for locality
+            // Only warpgroup 0, else will double multiply
+            if (warpgroupid == 0)
+            {
+                warpgroup::mul(grad_l_z2_smem[idx % K::stages], grad_l_z2_smem[idx % K::stages], last_eta_smem[idx % K::stages]);
+            }
+
+            // Update W2
             warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
             warpgroup::mma_AtB(cs_cs_fl_reg, x2_smem[warpgroupid], grad_l_z2_smem[idx % K::stages]);
             warpgroup::mma_async_wait();
@@ -291,8 +312,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 col_sum(b2_smem, grad_l_z2_smem[idx % K::stages]);
             }
 
-
-            // Update hidden states (W1)
+            // Update W1
             warpgroup::load(cs_cs_fl_reg, w1_smem[warpgroupid]);
             warpgroup::mma_AtB(cs_cs_fl_reg, k_smem[idx % K::stages], grad_l_z1_smem[warpgroupid]);
             warpgroup::mma_async_wait();
@@ -342,6 +362,7 @@ torch::Tensor ttt_forward(
     const torch::Tensor XQ,
     const torch::Tensor XK,
     const torch::Tensor XV,
+    const torch::Tensor last_eta,
     const torch::Tensor W1,
     const torch::Tensor b1,
     const torch::Tensor W2,
@@ -384,6 +405,9 @@ torch::Tensor ttt_forward(
     tile_gl v_gl{reinterpret_cast<bf16*>(XV.data_ptr<at::BFloat16>()), B, H, T, F};
     tile_gl o_gl{reinterpret_cast<bf16*>(Out.data_ptr<at::BFloat16>()), B, H, T, F};
 
+    // Prebroadcast this for efficiency
+    tile_gl last_eta_gl{reinterpret_cast<bf16*>(last_eta.data_ptr<at::BFloat16>()), B, H, T, F};
+
     tile_gl w1_init_gl{reinterpret_cast<bf16*>(W1.data_ptr<at::BFloat16>()), B, H, F, F*K};
     vec_gl b1_init_gl{reinterpret_cast<bf16*>(b1.data_ptr<at::BFloat16>()), B, H, 1, F*K};
     tile_gl w2_init_gl{reinterpret_cast<bf16*>(W2.data_ptr<at::BFloat16>()), B, H, F*K, F};
@@ -399,6 +423,7 @@ torch::Tensor ttt_forward(
         k_gl, 
         v_gl, 
         o_gl, 
+        last_eta_gl,
         w1_init_gl, 
         b1_init_gl,
         w2_init_gl, 

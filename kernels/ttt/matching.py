@@ -148,7 +148,7 @@ def compute_mini_batch(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
     return Z2_bar, W1_next, b1_next, W2_next, b2_next
 
 
-def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
+def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb, eta_mb):
     """
     Mini batch forward for TTT MLP.
 
@@ -182,11 +182,19 @@ def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
     grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2.transpose(-1,-2) * gelu_bwd(Z1)
 
     # Weight updates
-    W1_next = W1 - xk_mb.transpose(-1,-2) @ grad_l_wrt_Z1
-    b1_next = b1 - grad_l_wrt_Z1.sum(dim=-2, keepdim=True)
+    last_eta_mini_batch = eta_mb[:, :, -1, :, None]
 
-    W2_next = W2 - X2.transpose(-1,-2) @ grad_l_wrt_Z2
-    b2_next = b2 - grad_l_wrt_Z2.sum(dim=-2, keepdim=True)
+    W1_next = W1 - (last_eta_mini_batch * xk_mb).transpose(-1,-2) @ grad_l_wrt_Z1
+    b1_next = b1 - (last_eta_mini_batch * grad_l_wrt_Z1).sum(dim=-2, keepdim=True)
+
+    W2_next = W2 - (last_eta_mini_batch * X2).transpose(-1,-2) @ grad_l_wrt_Z2
+    b2_next = b2 - (last_eta_mini_batch * grad_l_wrt_Z2).sum(dim=-2, keepdim=True)
+
+
+    # W1_last = W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
+    # b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
+    # W2_last = W2_init - (last_eta_mini_batch * X2).transpose(-1, -2) @ grad_l_wrt_Z2
+    # b2_last = b2_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z2, dim=-2, keepdim=True)
 
     Z1_bar = xq_mb @ W1_next + b1_next
     X2_bar = torch.nn.functional.gelu(Z1_bar, approximate="tanh")
@@ -241,12 +249,14 @@ def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
 def main():
     torch.manual_seed(0)
     # Define shapes
-    B = 2
-    NH = 2
+    B = 1
+    NH = 1
     K = 2
+    
     seq_len = 128
     mini_batch_size = 64
     NC = seq_len // mini_batch_size
+    checkpoint_group_size = NC // K
 
     head_dim = 64
     expansion_dim = 256
@@ -260,16 +270,9 @@ def main():
     xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
     xk_clone = xk.clone().contiguous()
     xv = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    # Create inputs
-    # xq = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    # xk = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    # xk_clone = xk.clone().contiguous()
-    # xv = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    # num_elements = B * NH * NC * mini_batch_size * head_dim
-    # xq = torch.arange(num_elements, dtype=dtype, device=device).reshape(B, NH, NC, mini_batch_size, head_dim).contiguous()
-    # xk = torch.arange(num_elements, dtype=dtype, device=device).reshape(B, NH, NC, mini_batch_size, head_dim).contiguous()
-    # xk_clone = xk.clone().contiguous()
-    # xv = torch.arange(num_elements, dtype=dtype, device=device).reshape(B, NH, NC, mini_batch_size, head_dim).contiguous()
+
+    eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous()
+    last_eta = eta[:, :, :, -1, :, None].repeat(1, 1, 1, 1, head_dim).contiguous()
 
     W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=dtype, device=device).contiguous() * 0.02
     b1 = torch.zeros(B, NH, 1, expansion_dim, dtype=dtype, device=device).contiguous() * 0.02
@@ -282,6 +285,11 @@ def main():
     W2_checkpoints = torch.empty(B, NH, K, expansion_dim, head_dim, dtype=dtype, device=device).contiguous()
     b2_checkpoints = torch.empty(B, NH, K, 1, head_dim, dtype=dtype, device=device).contiguous()
 
+    W1_checkpoints_ref = torch.empty(B, NH, K, head_dim, expansion_dim, dtype=dtype, device=device).contiguous()
+    b1_checkpoints_ref = torch.empty(B, NH, K, 1, expansion_dim, dtype=dtype, device=device).contiguous()
+    W2_checkpoints_ref = torch.empty(B, NH, K, expansion_dim, head_dim, dtype=dtype, device=device).contiguous()
+    b2_checkpoints_ref = torch.empty(B, NH, K, 1, head_dim, dtype=dtype, device=device).contiguous()
+
     # Create output buffers
     output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
     Z2_bar_pt_shard = torch.zeros(NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
@@ -292,6 +300,7 @@ def main():
         xq,
         xk_clone,
         xv,
+        last_eta,
         W1,
         b1,
         W2,
@@ -309,14 +318,21 @@ def main():
     for i in range(NC):
         seq_idx = i * mini_batch_size
 
+        if i % checkpoint_group_size == 0:
+            checkpoint_idx = i // checkpoint_group_size
+            W1_checkpoints_ref[:, :, checkpoint_idx] = W1_curr
+            b1_checkpoints_ref[:, :, checkpoint_idx] = b1_curr
+            W2_checkpoints_ref[:, :, checkpoint_idx] = W2_curr
+            b2_checkpoints_ref[:, :, checkpoint_idx] = b2_curr
+
         xq_mb = xq[:,:,i]
         xk_mb = xk[:,:,i]
         xv_mb = xv[:,:,i]
+        eta_mb = eta[:, :, i]
 
         # Z2_bar_pt_shard[i], W1_other, b1_other, W2_other, b2_other = compute_mini_batch_shard(W1[0][0], b1[0][0], W2[0][0], b2[0][0], xq_mb[0][0], xk_mb[0][0], xv_mb[0][0], shard_size)
-        output_ref[:, :, i], W1_curr, b1_curr, W2_curr, b2_curr = compute_mini_batch_no_dual(W1_curr, b1_curr, W2_curr, b2_curr, xq_mb, xk_mb, xv_mb)
-        
-        breakpoint()
+        output_ref[:, :, i], W1_curr, b1_curr, W2_curr, b2_curr = compute_mini_batch_no_dual(W1_curr, b1_curr, W2_curr, b2_curr, xq_mb, xk_mb, xv_mb, eta_mb)
+ 
     breakpoint()
 
     # # Compare outputs
