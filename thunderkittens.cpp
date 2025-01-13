@@ -30,6 +30,8 @@ extern torch::Tensor ttt_forward(
     const torch::Tensor XK,
     const torch::Tensor XV,
     const torch::Tensor last_eta,
+    const torch::Tensor ttt_norm_weight,
+    const torch::Tensor ttt_norm_bias,
     const torch::Tensor W1,
     const torch::Tensor b1,
     const torch::Tensor W2,

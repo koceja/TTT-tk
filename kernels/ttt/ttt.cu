@@ -35,6 +35,9 @@ template <int head_dim> struct fwd_globals {
 
     using last_eta_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
 
+    using ttt_norm_weight_gl = gl<bf16, -1, -1, -1, -1, vec_type>;
+    using ttt_norm_bias_gl = gl<bf16, -1, -1, -1, -1, vec_type>;
+
     using w1_init_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
     using b1_init_gl = gl<bf16, -1, -1, -1, -1, vec_type>;
     using w2_init_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
@@ -52,6 +55,9 @@ template <int head_dim> struct fwd_globals {
     o_gl o;
 
     last_eta_gl last_eta;
+
+    ttt_norm_weight_gl ttt_norm_weight;
+    ttt_norm_bias_gl ttt_norm_bias;
 
     w1_init_gl w1;
     b1_init_gl b1;
@@ -77,24 +83,21 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     using vec_type = sv_bf<K::tile_height>;
 
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
-    int tp = cluster.block_rank();
+    const int tp = cluster.block_rank();
 
+    // For input indexing
     const int batch_idx = blockIdx.y;
     const int head_idx = blockIdx.z;
     const int n_minibatch = g.seq_len / (K::tile_height);
     const int n_remat_groups = g.num_checkpoints;
     const int checkpoint_group_size = g.checkpoint_group_size;
 
-    int warpid = kittens::warpid(); // Global warp ID
-    int wg_warpid = warpid % kittens::WARPGROUP_WARPS; // Warp ID within Warpgroup
-    int warpgroupid = warpid / kittens::WARPGROUP_WARPS; // Warpgroup ID
-    int cluster_wgid = warpgroupid + CONSUMER_WARPGROUPS * tp; // Cluster Warpgroup ID
+    // Block info
+    const int warpid = kittens::warpid(); // Global warp ID
+    const int wg_warpid = warpid % kittens::WARPGROUP_WARPS; // Warp ID within Warpgroup
+    const int warpgroupid = warpid / kittens::WARPGROUP_WARPS; // Warpgroup ID
+    const int cluster_wgid = warpgroupid + CONSUMER_WARPGROUPS * tp; // Cluster Warpgroup ID
     const int tp_shard_rank = cluster_wgid;
-
-    // if (warpgroupid < 2)
-    // {
-    //     printf("Warpid=%d, wg_warpid=%d, warpgroupid=%d, cluster_wgid=%d, tp=%d\n", warpid, wg_warpid, warpgroupid, cluster_wgid, tp);
-    // }
 
     extern __shared__ int __shm[];
     tma_swizzle_allocator al((int *)&__shm[0]);
@@ -110,33 +113,41 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     tile_type(&k_smem)[K::stages] = al.allocate<tile_type, K::stages>();
     tile_type(&v_smem)[K::stages] = al.allocate<tile_type, K::stages>();
     tile_type(&last_eta_smem)[K::stages] = al.allocate<tile_type, K::stages>();
+
+    // Shared memory for ttt norm params
+    vec_type(&ttt_norm_weight_smem) = al.allocate<vec_type>();
+    vec_type(&ttt_norm_bias_smem) = al.allocate<vec_type>();
     
     // Shared memory for intermediates
     tile_type(&z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
     tile_type(&x2_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
     tile_type(&grad_l_z1_smem)[CONSUMER_WARPGROUPS] = al.allocate<tile_type, CONSUMER_WARPGROUPS>();
+    sv_bf<16>(&ln_smem)[4] = al.allocate<sv_bf<16>, 4>();
 
-    // tile_type(&attn1_smem) = al.allocate<tile_type>();
     tile_type(&reduction_buffer) = al.allocate<tile_type>();
 
     // Reinterpretations for intermediates
     auto(*z2_smem) = reinterpret_cast<tile_type(*)>(grad_l_z1_smem);
     auto(*grad_l_z2_smem) = reinterpret_cast<tile_type(*)>(v_smem);
-    auto(*x2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
-    // auto(*attn2_smem) = reinterpret_cast<tile_type(*)>(grad_l_z1_smem);
-    auto(*z2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
+    // auto(*x2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
+    // auto(*z2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
 
+    // Create locks to make sure reads aren't premature
     __shared__ kittens::semaphore 
         w1_arrived,
         w2_arrived,
         b1_arrived,
         b2_arrived,
         dsmem_semaphore,
+        second_dsmem_semaphore,
         reduction_done,
+        second_reduction_done,
         q_sem_arrived[K::stages],
         k_sem_arrived[K::stages], 
         v_sem_arrived[K::stages],
         last_eta_sem_arrived[K::stages],
+        ttt_norm_weight_arrived,
+        ttt_norm_bias_arrived,
         compute_done[K::stages];
 
     if (threadIdx.x == 0) {
@@ -144,8 +155,12 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
         init_semaphore(b1_arrived, 0, 1);
         init_semaphore(w2_arrived, 0, 1);
         init_semaphore(b2_arrived, 0, 1);
+        init_semaphore(ttt_norm_weight_arrived, 0, 1);
+        init_semaphore(ttt_norm_bias_arrived, 0, 1);
         init_semaphore(dsmem_semaphore, 0, 1);
+        init_semaphore(second_dsmem_semaphore, 0, 1);
         init_semaphore(reduction_done, CONSUMER_WARPGROUPS, 0);
+        init_semaphore(second_reduction_done, CONSUMER_WARPGROUPS, 0);
         for (int i = 0; i < K::stages; i++) {
             init_semaphore(q_sem_arrived[i], 0, 1);
             init_semaphore(k_sem_arrived[i], 0, 1);
@@ -165,6 +180,12 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             tma::load_async(w2_smem[wg], g.w2, {batch_idx, head_idx, wg + CONSUMER_WARPGROUPS * tp, 0}, w2_arrived);
         }
         tma::load_async(b2_smem, g.b2, {batch_idx, head_idx, 0, 0}, b2_arrived);
+
+        // ttt norm params
+        tma::expect_bytes(ttt_norm_weight_arrived, sizeof(vec_type));
+        tma::expect_bytes(ttt_norm_bias_arrived, sizeof(vec_type));
+        tma::load_async(ttt_norm_weight_smem, g.ttt_norm_weight, {0, head_idx, 0, 0}, ttt_norm_weight_arrived);
+        tma::load_async(ttt_norm_bias_smem, g.ttt_norm_bias, {0, head_idx, 0, 0}, ttt_norm_bias_arrived);
 
         // Preload minibatches
         for (int j = 0; j < K::stages - 1; j++) {
@@ -211,12 +232,16 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
         warpgroup::increase_registers<240>();
 
         rt_fl<16, K::tile_height> cs_cs_fl_reg;
+        rt_fl<16, K::tile_height> cs_cs_fl_reg2;
         typeof(cs_cs_fl_reg)::row_vec cs_row_fl_reg;
+        typeof(cs_cs_fl_reg)::col_vec cs_col_fl_reg;
 
         kittens::wait(w1_arrived, 0);
         kittens::wait(b1_arrived, 0);
         kittens::wait(w2_arrived, 0);
         kittens::wait(b2_arrived, 0);
+        kittens::wait(ttt_norm_weight_arrived, 0);
+        kittens::wait(ttt_norm_bias_arrived, 0);
 
         for (auto idx = 0; idx < n_minibatch; idx++) {
             // Save hidden state checkpoint (W1)
@@ -267,11 +292,82 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 if (wg_warpid == 0) tma::expect_bytes(dsmem_semaphore, sizeof(reduction_buffer));
                 tma::cluster::sync();
                 if (wg_warpid == 0) tma::cluster::store_async(reduction_buffer, z2_smem[0], tp ^ 1, dsmem_semaphore);
-                // This operation is flipped so that it can be accumulated without having to flip signs
-                warpgroup::sub(grad_l_z2_smem[idx % K::stages], z2_smem[0], v_smem[idx % K::stages]);
+
+                // reduction here to do ln
                 kittens::wait(dsmem_semaphore, idx % 2);
                 warpgroup::sync(1);
-                warpgroup::add(grad_l_z2_smem[idx % K::stages], reduction_buffer, grad_l_z2_smem[idx % K::stages]);
+                warpgroup::add(z2_smem[0], z2_smem[0], reduction_buffer);
+
+                // mean
+                zero(cs_col_fl_reg);
+                warpgroup::load(cs_cs_fl_reg, z2_smem[0]);
+                row_sum(cs_col_fl_reg, cs_cs_fl_reg);
+                div(cs_col_fl_reg, cs_col_fl_reg, static_cast<float>(head_dim)); // mu_fused
+
+                sub_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg); // Z2 - mu_fused, first part of xhat
+                warpgroup::store(z2_smem[1], cs_cs_fl_reg);
+                
+
+                // var
+                warpgroup::load(cs_cs_fl_reg, z2_smem[0]);
+                sub_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
+                mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg);
+
+                zero(cs_col_fl_reg);
+                row_sum(cs_col_fl_reg, cs_cs_fl_reg);
+                div(cs_col_fl_reg, cs_col_fl_reg, static_cast<float>(head_dim)); // var
+                add(cs_col_fl_reg, cs_col_fl_reg, 1e-6f); 
+                sqrt(cs_col_fl_reg, cs_col_fl_reg); // std
+                store(ln_smem[wg_warpid], cs_col_fl_reg);
+
+                // finish x_hat
+                warpgroup::load(cs_cs_fl_reg, z2_smem[1]);
+                div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg); // final x_hat
+                warpgroup::store(z2_smem[0], cs_cs_fl_reg);
+
+                // compute y
+                load(cs_row_fl_reg, ttt_norm_weight_smem);
+                mul_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
+                load(cs_row_fl_reg, ttt_norm_bias_smem);
+                add_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg); // y
+                
+                // grad_output
+                warpgroup::load(cs_cs_fl_reg2, v_smem[idx % K::stages]);
+                sub(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
+                warpgroup::load(cs_cs_fl_reg2, k_smem[idx % K::stages]);
+                add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
+       
+                // grad x_hat
+                load(cs_row_fl_reg, ttt_norm_weight_smem);
+                mul_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
+
+
+                warpgroup::load(cs_cs_fl_reg2, z2_smem[0]);
+                mul(cs_cs_fl_reg2, cs_cs_fl_reg, cs_cs_fl_reg2);
+                zero(cs_col_fl_reg);
+                row_sum(cs_col_fl_reg, cs_cs_fl_reg2);
+                warpgroup::load(cs_cs_fl_reg2, z2_smem[0]);
+                mul_row(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg); // 3rd line, not negative
+
+                zero(cs_col_fl_reg);
+                row_sum(cs_col_fl_reg, cs_cs_fl_reg);
+                add_row(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
+
+                mul(cs_cs_fl_reg, cs_cs_fl_reg, static_cast<float>(head_dim));
+                sub(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
+                div(cs_cs_fl_reg, cs_cs_fl_reg, static_cast<float>(head_dim));
+                load(cs_col_fl_reg, ln_smem[wg_warpid]);
+                div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
+                mul(cs_cs_fl_reg, cs_cs_fl_reg, -1.0f); // negate to prepare for grad step
+
+                warpgroup::store(grad_l_z2_smem[idx % K::stages], cs_cs_fl_reg);
+
+
+                // // This operation is flipped so that it can be accumulated without having to flip signs
+                // warpgroup::sub(grad_l_z2_smem[idx % K::stages], z2_smem[0], v_smem[idx % K::stages]);
+                // // kittens::wait(dsmem_semaphore, idx % 2);
+                // // warpgroup::sync(1);
+                // warpgroup::add(grad_l_z2_smem[idx % K::stages], reduction_buffer, grad_l_z2_smem[idx % K::stages]);
             }
             else {
                 tma::cluster::arrive_aligned();
@@ -342,10 +438,71 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             }
             warpgroup::store(z2_smem[warpgroupid], cs_cs_fl_reg);
 
-            // Store output to global
-            if (wg_warpid == 0) {
-                tma::store_add_async(g.o, z2_smem[warpgroupid], {batch_idx, head_idx, idx, 0});
+            // Warpgroup 0 will perform reduction
+            if (warpgroupid == 0) {
+                // Reduce intra CTA Z2 before inter CTA reduce
+                warpgroup::add(z2_smem[0], z2_smem[0], z2_smem[1]); // Ideally we can do an atomic store into shared memory
+                if (wg_warpid == 0) tma::expect_bytes(second_dsmem_semaphore, sizeof(reduction_buffer));
+                tma::cluster::sync();
+                if (wg_warpid == 0) tma::cluster::store_async(reduction_buffer, z2_smem[0], tp ^ 1, second_dsmem_semaphore);
+
+                // reduction here to do ln
+                kittens::wait(second_dsmem_semaphore, idx % 2);
+                warpgroup::sync(1);
+                warpgroup::add(z2_smem[0], z2_smem[0], reduction_buffer);
+
+                // mean
+                zero(cs_col_fl_reg);
+                warpgroup::load(cs_cs_fl_reg, z2_smem[0]);
+                row_sum(cs_col_fl_reg, cs_cs_fl_reg);
+                div(cs_col_fl_reg, cs_col_fl_reg, static_cast<float>(head_dim)); // mu_fused
+
+                sub_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg); // Z2 - mu_fused, first part of xhat
+                warpgroup::store(z2_smem[1], cs_cs_fl_reg);
+                
+
+                // var
+                warpgroup::load(cs_cs_fl_reg, z2_smem[0]);
+                sub_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
+                mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg);
+
+                zero(cs_col_fl_reg);
+                row_sum(cs_col_fl_reg, cs_cs_fl_reg);
+                div(cs_col_fl_reg, cs_col_fl_reg, static_cast<float>(head_dim)); // var
+                add(cs_col_fl_reg, cs_col_fl_reg, 1e-6f); 
+                sqrt(cs_col_fl_reg, cs_col_fl_reg); // std
+                store(ln_smem[wg_warpid], cs_col_fl_reg);
+
+                // finish x_hat
+                warpgroup::load(cs_cs_fl_reg, z2_smem[1]);
+                div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg); // final x_hat
+                warpgroup::store(z2_smem[0], cs_cs_fl_reg);
+
+                // compute y
+                load(cs_row_fl_reg, ttt_norm_weight_smem);
+                mul_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
+                load(cs_row_fl_reg, ttt_norm_bias_smem);
+                add_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg); // y
+
+                // Residual
+                warpgroup::load(cs_cs_fl_reg2, q_smem[idx % K::stages]);
+                add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
+                
+                warpgroup::store(z2_smem[0], cs_cs_fl_reg);
+
+                // Store output to global
+                if (wg_warpid == 0) {
+                    tma::store_async(g.o, z2_smem[0], {batch_idx, head_idx, idx, 0});
+                    tma::store_commit_group();
+                }
             }
+            else {
+                tma::cluster::arrive_aligned();
+            }
+
+            // // Wait on each other to complete
+            // if (warpgroup::laneid() == 0) arrive(second_reduction_done, 1);
+            // kittens::wait(second_reduction_done, idx % 2);
 
             if (warpgroup::laneid() == 0) arrive(compute_done[idx % K::stages], 1);
         }
@@ -363,6 +520,8 @@ torch::Tensor ttt_forward(
     const torch::Tensor XK,
     const torch::Tensor XV,
     const torch::Tensor last_eta,
+    const torch::Tensor ttt_norm_weight,
+    const torch::Tensor ttt_norm_bias,
     const torch::Tensor W1,
     const torch::Tensor b1,
     const torch::Tensor W2,
@@ -380,7 +539,7 @@ torch::Tensor ttt_forward(
     unsigned long T = XQ.size(2) * XQ.size(3); // seq len
     const int NC = XQ.size(2);
     const int CS = XQ.size(3);
-    unsigned long num_checkpoints = W1_checkpoints.size(2);
+    unsigned long num_checkpoints = static_cast<int>(W1_checkpoints.size(2));
     const int checkpoint_group_size = NC / num_checkpoints;
 
     TORCH_CHECK(NC % num_checkpoints == 0, "N % R == 0");
@@ -393,6 +552,8 @@ torch::Tensor ttt_forward(
     TORCH_CHECK(W1_checkpoints.device().is_cuda() && W1_checkpoints.is_contiguous() && W1_checkpoints.dim() == 5 && W1_checkpoints.size(0) == B && W1_checkpoints.size(1) == H && W1_checkpoints.size(2) == num_checkpoints && W1_checkpoints.size(3) == F && W1_checkpoints.size(4) == F*K, "Invalid dims for W1_checkpoints");
     TORCH_CHECK(W2_checkpoints.device().is_cuda() && W2_checkpoints.is_contiguous() && W2_checkpoints.dim() == 5 && W2_checkpoints.size(0) == B && W2_checkpoints.size(1) == H && W2_checkpoints.size(2) == num_checkpoints && W2_checkpoints.size(3) == F*K && W2_checkpoints.size(4) == F, "Invalid dims for W2_checkpoints");
     TORCH_CHECK(Out.device().is_cuda() && Out.is_contiguous() && Out.dim() == 5 && Out.size(4) == F, "Invalid dims for Out");
+
+    TORCH_CHECK(ttt_norm_weight.device().is_cuda() && ttt_norm_weight.is_contiguous() && ttt_norm_weight.dim() == 4 && ttt_norm_weight.size(0) == 1 && ttt_norm_weight.size(1) == H && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(3) == F, "Invalid dims for ttt_norm_weight");
 
     using tile_type = st_bf<fwd_ttt_mlp_ker_tile_dims<F>::tile_height, fwd_ttt_mlp_ker_tile_dims<F>::tile_width>;
     using tile_gl = gl<bf16, -1, -1, -1, -1, tile_type>;
@@ -407,6 +568,9 @@ torch::Tensor ttt_forward(
 
     // Prebroadcast this for efficiency
     tile_gl last_eta_gl{reinterpret_cast<bf16*>(last_eta.data_ptr<at::BFloat16>()), B, H, T, F};
+
+    vec_gl ttt_norm_weight_gl{reinterpret_cast<bf16*>(ttt_norm_weight.data_ptr<at::BFloat16>()), 1, H, 1, F};
+    vec_gl ttt_norm_bias_gl{reinterpret_cast<bf16*>(ttt_norm_bias.data_ptr<at::BFloat16>()), 1, H, 1, F};
 
     tile_gl w1_init_gl{reinterpret_cast<bf16*>(W1.data_ptr<at::BFloat16>()), B, H, F, F*K};
     vec_gl b1_init_gl{reinterpret_cast<bf16*>(b1.data_ptr<at::BFloat16>()), B, H, 1, F*K};
@@ -424,6 +588,8 @@ torch::Tensor ttt_forward(
         v_gl, 
         o_gl, 
         last_eta_gl,
+        ttt_norm_weight_gl,
+        ttt_norm_bias_gl,
         w1_init_gl, 
         b1_init_gl,
         w2_init_gl, 
@@ -432,8 +598,8 @@ torch::Tensor ttt_forward(
         b1_checkpoints_gl,
         w2_checkpoints_gl, 
         b2_checkpoints_gl,
-        T,
-        num_checkpoints,
+        static_cast<int>(T),
+        static_cast<int>(num_checkpoints),
         checkpoint_group_size
     };
 
@@ -446,8 +612,16 @@ torch::Tensor ttt_forward(
     dim3 grid(TP, B, H);
     fwd_ttt_mlp_ker<F><<<grid, NUM_WORKERS*32, mem_size>>>(g);
 
-    TORCH_CHECK(cudaGetLastError() == cudaSuccess, "CUDA error launching kernel");
-    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA Kernel Launch Error: %s\n", cudaGetErrorString(err));
+    }
+
+    // Ensure the kernel execution completes
+    cudaError_t syncErr = cudaDeviceSynchronize();
+    if (syncErr != cudaSuccess) {
+        printf("CUDA Kernel Execution Error: %s\n", cudaGetErrorString(syncErr));
+    }
 
     return Out;
 }//*/

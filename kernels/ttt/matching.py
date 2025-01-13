@@ -148,7 +148,130 @@ def compute_mini_batch(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb):
     return Z2_bar, W1_next, b1_next, W2_next, b2_next
 
 
-def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb, eta_mb):
+
+
+# def ln_fused_l2_bwd(x, l2_target, gamma, beta, eps=1e-6):
+#     "Batch backward for LayerNorm fused with L2 loss."
+#     D = x.shape[-1]
+
+#     # Mean and variance computation
+#     mu = x.mean(dim=-1, keepdim=True)
+#     var = x.var(dim=-1, keepdim=True, unbiased=False)
+
+#     # Normalization
+#     std = torch.sqrt(var + eps)
+#     x_hat = (x - mu) / std
+
+#     # Scale and shift
+#     y = gamma * x_hat + beta
+
+#     grad_output = y - l2_target
+#     grad_x_hat = grad_output * gamma
+#     z = (
+#         (1.0 / D)
+#         * (
+#             D * grad_x_hat
+#             - grad_x_hat.sum(dim=-1, keepdim=True)
+#             - x_hat * (grad_x_hat * x_hat).sum(dim=-1, keepdim=True)
+#         )
+#         / std
+#     )
+
+#     return z
+
+
+
+# def forward(
+#     ttt_norm_weight,
+#     ttt_norm_bias,
+#     W1_init,
+#     b1_init,
+#     W2_init,
+#     b2_init,
+#     XQ_mini_batch,
+#     XV_mini_batch,
+#     XK_mini_batch,
+#     eta_mini_batch,
+#     num_heads,
+#     head_dim,
+# ):
+#     # Stage 1: MatMul
+#     Z1 = XK_mini_batch @ W1_init + b1_init
+#     X2 = F.gelu(Z1, approximate="tanh")
+#     Z2 = X2 @ W2_init + b2_init
+#     reconstruction_target = XV_mini_batch - XK_mini_batch
+
+#     ln_weight = ttt_norm_weight.reshape(num_heads, 1, head_dim)
+#     ln_bias = ttt_norm_bias.reshape(num_heads, 1, head_dim)
+
+#     # Stage 2: LnFusedL2BWD
+#     eps = 1e-6
+#     mu_fused = Z2.mean(dim=-1, keepdim=True)
+#     var_fused = Z2.var(dim=-1, keepdim=True, unbiased=False)
+
+#     std_fused = torch.sqrt(var_fused + eps)
+#     x_hat_fused = (Z2 - mu_fused) / std_fused
+
+#     y = ln_weight * x_hat_fused + ln_bias
+#     grad_output_fused = y - reconstruction_target
+#     grad_x_hat_fused = grad_output_fused * ln_weight
+
+#     grad_l_wrt_Z2 = (
+#         (1.0 / head_dim)
+#         * (
+#             head_dim * grad_x_hat_fused
+#             - grad_x_hat_fused.sum(dim=-1, keepdim=True)
+#             - x_hat_fused * (grad_x_hat_fused * x_hat_fused).sum(dim=-1, keepdim=True)
+#         )
+#         / std_fused
+#     )
+
+#     grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2_init.transpose(-2, -1) * gelu_bwd(Z1)
+
+#     # # Stage 3: Dual Form
+#     # Attn1 = torch.tril(XQ_mini_batch @ XK_mini_batch.transpose(-2, -1))
+#     # b1_bar = b1_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z1
+#     # Z1_bar = XQ_mini_batch @ W1_init - (eta_mini_batch * Attn1) @ grad_l_wrt_Z1 + b1_bar
+
+#     # X2_bar = F.gelu(Z1_bar, approximate="tanh")
+
+#     # Attn2 = torch.tril(X2_bar @ X2.transpose(-2, -1))
+#     # b2_bar = b2_init - torch.tril(eta_mini_batch) @ grad_l_wrt_Z2
+#     # Z2_bar = X2_bar @ W2_init - (eta_mini_batch * Attn2) @ grad_l_wrt_Z2 + b2_bar
+
+#     last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
+
+#     W1_last = W1_init - (last_eta_mini_batch * XK_mini_batch).transpose(-1, -2) @ grad_l_wrt_Z1
+#     b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
+
+#     W2_last = W2_init - (last_eta_mini_batch * X2).transpose(-1, -2) @ grad_l_wrt_Z2
+#     b2_last = b2_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z2, dim=-2, keepdim=True)
+
+#     # Stage 4: LN
+#     mu_ln = Z2_bar.mean(dim=-1, keepdim=True)
+#     var_ln = Z2_bar.var(dim=-1, keepdim=True, unbiased=False)
+#     std_ln = torch.sqrt(var_ln + eps)
+#     x_hat_ln = (Z2_bar - mu_ln) / std_ln
+
+#     Z2_bar_ln = ln_weight * x_hat_ln + ln_bias
+
+#     XQW_mini_batch = XQ_mini_batch + Z2_bar_ln
+
+#     return W1_last, b1_last, W2_last, b2_last, XQW_mini_batch
+
+
+def compute_mini_batch_no_dual(
+    W1, 
+    b1, 
+    W2, 
+    b2, 
+    xq_mb, 
+    xk_mb, 
+    xv_mb, 
+    eta_mb,
+    ttt_norm_weight,
+    ttt_norm_bias,
+):
     """
     Mini batch forward for TTT MLP.
 
@@ -166,19 +289,51 @@ def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb, eta_mb):
     CS: Mini-batch size
     F: Head dimension
     K: Expansion dimension
-
-    Excludes:
-    - ILR
-    - LayerNorm
-    - Residual connection
     """
+    num_heads = xk_mb.shape[1]
+    head_dim = xk_mb.shape[-1]
+
     # Inner model forward
     Z1 = xk_mb @ W1 + b1
     X2 = torch.nn.functional.gelu(Z1, approximate="tanh")
     Z2 = X2 @ W2 + b2
 
+
+    reconstruction_target = xv_mb.to(torch.float32) - xk_mb.to(torch.float32)
+
+    ln_weight = ttt_norm_weight.reshape(num_heads, 1, head_dim)
+    ln_bias = ttt_norm_bias.reshape(num_heads, 1, head_dim)
+
+    # Stage 2: LnFusedL2BWD
+
+    eps = 1e-6
+    Z2 = Z2.to(torch.float32)
+    mu_fused = Z2.mean(dim=-1, keepdim=True)
+    var_fused = Z2.var(dim=-1, keepdim=True, unbiased=False)
+
+    std_fused = torch.sqrt(var_fused + eps)
+    x_hat_fused = (Z2 - mu_fused) / std_fused
+
+    ln_weight = ln_weight.to(torch.float32)
+    ln_bias = ln_bias.to(torch.float32)
+    y = ln_weight * x_hat_fused + ln_bias
+    grad_output_fused = y - reconstruction_target
+    grad_x_hat_fused = grad_output_fused * ln_weight
+
+    grad_l_wrt_Z2 = (
+        (1.0 / head_dim)
+        * (
+            head_dim * grad_x_hat_fused
+            - grad_x_hat_fused.sum(dim=-1, keepdim=True)
+            - x_hat_fused * (grad_x_hat_fused * x_hat_fused).sum(dim=-1, keepdim=True)
+        )
+        / std_fused
+    )
+
+    grad_l_wrt_Z2 = grad_l_wrt_Z2.to(torch.bfloat16)
+
     # Gradient calculation
-    grad_l_wrt_Z2 = xv_mb - Z2
+    # grad_l_wrt_Z2 = xv_mb - Z2
     grad_l_wrt_Z1 = grad_l_wrt_Z2 @ W2.transpose(-1,-2) * gelu_bwd(Z1)
 
     # Weight updates
@@ -190,18 +345,24 @@ def compute_mini_batch_no_dual(W1, b1, W2, b2, xq_mb, xk_mb, xv_mb, eta_mb):
     W2_next = W2 - (last_eta_mini_batch * X2).transpose(-1,-2) @ grad_l_wrt_Z2
     b2_next = b2 - (last_eta_mini_batch * grad_l_wrt_Z2).sum(dim=-2, keepdim=True)
 
-
-    # W1_last = W1_init - (last_eta_mini_batch * X1).transpose(-1, -2) @ grad_l_wrt_Z1
-    # b1_last = b1_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z1, dim=-2, keepdim=True)
-    # W2_last = W2_init - (last_eta_mini_batch * X2).transpose(-1, -2) @ grad_l_wrt_Z2
-    # b2_last = b2_init - torch.sum(last_eta_mini_batch * grad_l_wrt_Z2, dim=-2, keepdim=True)
-
+    # Post grad forward
     Z1_bar = xq_mb @ W1_next + b1_next
     X2_bar = torch.nn.functional.gelu(Z1_bar, approximate="tanh")
     Z2_bar = X2_bar @ W2_next + b2_next
 
+    # Ln
+    mu_ln = Z2_bar.mean(dim=-1, keepdim=True)
+    var_ln = Z2_bar.var(dim=-1, keepdim=True, unbiased=False)
+    std_ln = torch.sqrt(var_ln + eps)
+    x_hat_ln = (Z2_bar - mu_ln) / std_ln
 
-    return Z2_bar, W1_next, b1_next, W2_next, b2_next
+    Z2_bar_ln = ln_weight * x_hat_ln + ln_bias
+
+    # Residual
+    XQW_mini_batch = xq_mb + Z2_bar_ln
+
+
+    return XQW_mini_batch, W1_next, b1_next, W2_next, b2_next
 
 
 # def main():
@@ -251,9 +412,9 @@ def main():
     # Define shapes
     B = 1
     NH = 1
-    K = 2
+    K = 1
     
-    seq_len = 128
+    seq_len = 64
     mini_batch_size = 64
     NC = seq_len // mini_batch_size
     checkpoint_group_size = NC // K
@@ -273,6 +434,9 @@ def main():
 
     eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous()
     last_eta = eta[:, :, :, -1, :, None].repeat(1, 1, 1, 1, head_dim).contiguous()
+
+    ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous()
+    ttt_norm_bias = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous()
 
     W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=dtype, device=device).contiguous() * 0.02
     b1 = torch.zeros(B, NH, 1, expansion_dim, dtype=dtype, device=device).contiguous() * 0.02
@@ -301,6 +465,8 @@ def main():
         xk_clone,
         xv,
         last_eta,
+        ttt_norm_weight,
+        ttt_norm_bias,
         W1,
         b1,
         W2,
@@ -316,8 +482,6 @@ def main():
 
     # Compute mini-batches for PyTorch
     for i in range(NC):
-        seq_idx = i * mini_batch_size
-
         if i % checkpoint_group_size == 0:
             checkpoint_idx = i // checkpoint_group_size
             W1_checkpoints_ref[:, :, checkpoint_idx] = W1_curr
@@ -331,7 +495,24 @@ def main():
         eta_mb = eta[:, :, i]
 
         # Z2_bar_pt_shard[i], W1_other, b1_other, W2_other, b2_other = compute_mini_batch_shard(W1[0][0], b1[0][0], W2[0][0], b2[0][0], xq_mb[0][0], xk_mb[0][0], xv_mb[0][0], shard_size)
-        output_ref[:, :, i], W1_curr, b1_curr, W2_curr, b2_curr = compute_mini_batch_no_dual(W1_curr, b1_curr, W2_curr, b2_curr, xq_mb, xk_mb, xv_mb, eta_mb)
+        (
+            output_ref[:, :, i],
+            W1_curr,
+            b1_curr,
+            W2_curr,
+            b2_curr
+        ) = compute_mini_batch_no_dual(
+            W1_curr, 
+            b1_curr, 
+            W2_curr, 
+            b2_curr, 
+            xq_mb, 
+            xk_mb, 
+            xv_mb, 
+            eta_mb,
+            ttt_norm_weight,
+            ttt_norm_bias
+        )
  
     breakpoint()
 
