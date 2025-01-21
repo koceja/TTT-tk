@@ -157,7 +157,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     // Reinterpretations for intermediates
     auto(&reduction_buffer) = matmul_smem[0];
     auto(&z2_smem)[CONSUMER_WARPGROUPS] = grad_l_z1_smem;
-    auto(&grad_l_z2_smem) = v_smem[0];
+    auto(&grad_l_z2_smem) = v_smem[0]; // TODO: This is most definitely a bug
     // auto(&bf_tile_smem)[CONSUMER_WARPGROUPS] = v_smem;
     // auto(*x2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
     // auto(*z2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
@@ -305,13 +305,19 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 tma::store_commit_group();
             }
 
+
+
+
             const int curr_stage = idx % K::stages;
             const int curr_stage_lock_phase = (idx / K::stages) % 2;
 
             // Hidden state forward
             kittens::wait(k_sem_arrived[curr_stage], (idx / K::stages) % 2);
             zero(cs_cs_fl_reg);
-            warpgroup::copy(matmul_smem[warpgroupid], w1_smem[warpgroupid]);
+            warpgroup::load(cs_cs_fl_reg2, w1_smem[warpgroupid]);
+            warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
+            warpgroup::sync(warpgroupid+1);
+            // warpgroup::copy(matmul_smem[warpgroupid], w1_smem[warpgroupid]);
             warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], matmul_smem[warpgroupid]);
             load(cs_row_fl_reg, b1_smem[warpgroupid]);
             warpgroup::mma_async_wait();
@@ -322,7 +328,10 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::store(x2_smem[warpgroupid], cs_cs_fl_reg);
 
             zero(cs_cs_fl_reg);
-            warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
+            warpgroup::load(cs_cs_fl_reg2, w2_smem[warpgroupid]);
+            warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
+            warpgroup::sync(warpgroupid+1);
+            // warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
             warpgroup::mm_AB(cs_cs_fl_reg, x2_smem[warpgroupid], matmul_smem[warpgroupid]);
             warpgroup::mma_async_wait();
             // Only add b2 to one of the sharded Z2
@@ -443,7 +452,10 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
 
             // Calculate grad_l_wrt_Z1
             zero(cs_cs_fl_reg);
-            warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
+            // warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
+            warpgroup::load(cs_cs_fl_reg2, w2_smem[warpgroupid]);
+            warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
+            warpgroup::sync(warpgroupid+1);
             warpgroup::mm_ABt(cs_cs_fl_reg, grad_l_z2_smem, matmul_smem[warpgroupid]);
             warpgroup::mma_async_wait();
             warpgroup::store(grad_l_z1_smem[warpgroupid], cs_cs_fl_reg);
@@ -500,7 +512,10 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Compute output
             zero(cs_cs_fl_reg);
             kittens::wait(q_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
-            warpgroup::copy(matmul_smem[warpgroupid], w1_smem[warpgroupid]);
+            // warpgroup::copy(matmul_smem[warpgroupid], w1_smem[warpgroupid]);
+            warpgroup::load(cs_cs_fl_reg2, w1_smem[warpgroupid]);
+            warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
+            warpgroup::sync(warpgroupid+1);
             warpgroup::mm_AB(cs_cs_fl_reg, q_smem[idx % K::stages], matmul_smem[warpgroupid]);
             warpgroup::mma_async_wait();
             load(cs_row_fl_reg, b1_smem[warpgroupid]);
@@ -510,7 +525,10 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::store(x2_smem[warpgroupid], cs_cs_fl_reg);
             warpgroup::sync(warpgroupid+1);
 
-            warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
+            // warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
+            warpgroup::load(cs_cs_fl_reg2, w2_smem[warpgroupid]);
+            warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
+            warpgroup::sync(warpgroupid+1);
             warpgroup::mm_AB(cs_cs_fl_reg, x2_smem[warpgroupid], matmul_smem[warpgroupid]);
             warpgroup::mma_async_wait();
             // Only add b2 to one of the sharded Z2

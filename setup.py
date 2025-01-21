@@ -27,7 +27,7 @@ cuda_flags = [
     '-Xnvlink=--verbose',
     '-Xptxas=--verbose',
     '-Xptxas=--warn-on-spills',
-    # '-G',
+    '-G',
     '-diag-suppress=3189', # "module is parsed as an identifier rather than a keyword"
     f'-I{thunderkittens_root}/include',
     f'-I{thunderkittens_root}/prototype',
