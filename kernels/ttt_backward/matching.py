@@ -1,5 +1,5 @@
 import torch
-import thunderkittens
+# import thunderkittens
 import multiprocessing
 import time
 
@@ -302,6 +302,7 @@ def backward(
         / std_ln
     )
 
+
     # Stage 3: Dual Form
     
     last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
@@ -315,30 +316,29 @@ def backward(
     grad_L_b1_last += grad_L_Z1_bar.sum(dim=-2, keepdim=True)
     grad_L_W1_last += XQ_mini_batch.transpose(-2, -1) @ grad_L_Z1_bar
 
-
     grad_L_grad_l_wrt_Z1 = (
         - (last_eta_mini_batch * XK_mini_batch) @ grad_L_W1_last
-        - last_eta_mini_batch * grad_L_b1_last.sum(dim=-2, keepdim=True)
+        - last_eta_mini_batch * grad_L_b1_last
     )
     grad_L_grad_l_wrt_Z2 = (
         - (last_eta_mini_batch * X2) @ grad_L_W2_last
-        - last_eta_mini_batch * grad_L_b2_last.sum(dim=-2, keepdim=True)
+        - last_eta_mini_batch * grad_L_b2_last
         + (grad_L_grad_l_wrt_Z1 * gelu_bwd(Z1)) @ W2_init
     )
 
     grad_L_XQ_mini_batch = grad_L_Z1_bar @ W1_last.transpose(-2, -1)
 
     grad_L_XK_mini_batch = (
-        - (grad_L_W1_last @ grad_l_wrt_Z1.transpose(-2, -1)).transpose(-2, -1) * last_eta_mini_batch
+        - (grad_l_wrt_Z1 @ grad_L_W1_last.transpose(-2, -1)) * last_eta_mini_batch
     )
 
     grad_L_last_eta_in_mini_batch = (
-        -((grad_L_W2_last @ grad_l_wrt_Z2.transpose(-2, -1)).transpose(-2, -1) * X2).sum(dim=-1, keepdim=True)
-        - (grad_L_b2_last.sum(dim=-2, keepdim=True) * grad_l_wrt_Z2).sum(dim=-1, keepdim=True)
-        - ((grad_L_W1_last @ grad_l_wrt_Z1.transpose(-2, -1)).transpose(-2, -1) * XK_mini_batch).sum(
+        -((grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * X2).sum(dim=-1, keepdim=True)
+        - (grad_L_b2_last * grad_l_wrt_Z2).sum(dim=-1, keepdim=True)
+        - ((grad_l_wrt_Z1 @ grad_L_W1_last.transpose(-2, -1)) * XK_mini_batch).sum(
             dim=-1, keepdim=True
         )
-        - (grad_L_b1_last.sum(dim=-2, keepdim=True) * grad_l_wrt_Z1).sum(dim=-1, keepdim=True)
+        - (grad_L_b1_last * grad_l_wrt_Z1).sum(dim=-1, keepdim=True)
     )
 
     grad_L_eta_mini_batch = (
@@ -348,12 +348,12 @@ def backward(
     # Stage 2: LnFusedL2BWD
     grad_L_W2_init = (grad_L_grad_l_wrt_Z1 * gelu_bwd(Z1)).transpose(-2, -1) @ grad_l_wrt_Z2
 
-    grad_L_grad_x_hat_fused = (
-        (1.0 / std_fused) * grad_L_grad_l_wrt_Z2
-        + (1.0 / head_dim) * (-grad_L_grad_l_wrt_Z2 * (1.0 / std_fused)).sum(dim=-1, keepdim=True)
-        + (1.0 / head_dim)
-        * x_hat_fused
-        * (-grad_L_grad_l_wrt_Z2 * (1.0 / std_fused) * x_hat_fused).sum(dim=-1, keepdim=True)
+    grad_L_grad_x_hat_fused = (1.0 / std_fused) * (
+        grad_L_grad_l_wrt_Z2 + 
+        (-1.0 / head_dim) * (
+            (grad_L_grad_l_wrt_Z2 ).sum(dim=-1, keepdim=True) + 
+            x_hat_fused * (grad_L_grad_l_wrt_Z2 * x_hat_fused).sum(dim=-1, keepdim=True)
+        )
     )
 
     grad_L_y = ln_weight * grad_L_grad_x_hat_fused
@@ -365,22 +365,30 @@ def backward(
 
     grad_L_x_hat_fused = (
         grad_L_y * ln_weight
-        + (1.0 / head_dim)
-        * grad_x_hat_fused
-        * (-grad_L_grad_l_wrt_Z2 * (1.0 / std_fused) * x_hat_fused).sum(dim=-1, keepdim=True)
-        + (1.0 / head_dim)
-        * ((grad_x_hat_fused * x_hat_fused).sum(dim=-1, keepdim=True))
-        * (-grad_L_grad_l_wrt_Z2 * (1.0 / std_fused))
+        + (-1.0 / (head_dim * std_fused))
+        * (
+            grad_x_hat_fused * (grad_L_grad_l_wrt_Z2 * x_hat_fused).sum(dim=-1, keepdim=True)
+            + grad_L_grad_l_wrt_Z2 * (grad_x_hat_fused * x_hat_fused).sum(dim=-1, keepdim=True)
+        )
     )
 
-    grad_L_std = -grad_L_x_hat_fused * ((x_hat_fused) / std_fused) - grad_L_grad_l_wrt_Z2 * (
-        grad_l_wrt_Z2 * std_fused
-    ) / (std_fused**2)
+    # grad_L_std = -grad_L_x_hat_fused * ((x_hat_fused) / std_fused) - grad_L_grad_l_wrt_Z2 * (
+    #     grad_l_wrt_Z2 * std_fused
+    # ) / (std_fused**2)
+    grad_L_std = (-grad_L_x_hat_fused * ((x_hat_fused)) - grad_L_grad_l_wrt_Z2 *
+        grad_l_wrt_Z2
+    ) / std_fused
+
+    # grad_L_Z2 = (
+    #     grad_L_x_hat_fused * (1.0 / std_fused)
+    #     - (1.0 / head_dim) * grad_L_x_hat_fused.sum(dim=-1, keepdim=True) * (1.0 / std_fused)
+    #     + (1.0 / head_dim) * (grad_L_std).sum(dim=-1, keepdim=True) * x_hat_fused
+    # )
 
     grad_L_Z2 = (
         grad_L_x_hat_fused * (1.0 / std_fused)
-        - (1.0 / head_dim) * grad_L_x_hat_fused.sum(dim=-1, keepdim=True) * (1.0 / std_fused)
-        + (1.0 / head_dim) * (grad_L_std).sum(dim=-1, keepdim=True) * x_hat_fused
+        + (1.0 / head_dim) * ((grad_L_std).sum(dim=-1, keepdim=True) * x_hat_fused
+        - grad_L_x_hat_fused.sum(dim=-1, keepdim=True) * (1.0 / std_fused) )
     )
 
     grad_L_reconstruction_target = -ln_weight * grad_L_grad_x_hat_fused
@@ -394,8 +402,8 @@ def backward(
 
     # Stage 1: MatMul
     grad_L_X2 = (
-        - (grad_L_W2_last @ grad_l_wrt_Z2.transpose(-2, -1)).transpose(-2, -1) * last_eta_mini_batch
-        + grad_L_Z2 @ W2_init.transpose(-2, -1)
+        grad_L_Z2 @ W2_init.transpose(-2, -1)
+        - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
     )
         
     grad_L_Z1 = grad_L_X2 * gelu_bwd(Z1) + (
@@ -590,271 +598,272 @@ def match_backward_pytorch():
 
 
 def main():
-    torch.manual_seed(0)
-    # Define shapes
-    B = 1
-    NH = 48
-    K = 2
+    match_backward_pytorch()
+    # torch.manual_seed(0)
+    # # Define shapes
+    # B = 1
+    # NH = 48
+    # K = 2
     
-    seq_len = 256
-    mini_batch_size = 64
-    CS = mini_batch_size
-    NC = seq_len // mini_batch_size
-    checkpoint_group_size = NC // K
+    # seq_len = 256
+    # mini_batch_size = 64
+    # CS = mini_batch_size
+    # NC = seq_len // mini_batch_size
+    # checkpoint_group_size = NC // K
 
-    head_dim = 64
-    F = head_dim
-    expansion_dim = 256
-    shard_size = 4
+    # head_dim = 64
+    # F = head_dim
+    # expansion_dim = 256
+    # shard_size = 4
 
-    dtype = torch.bfloat16
-    full_dtype = torch.float32
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # device = 'cpu'
+    # dtype = torch.bfloat16
+    # full_dtype = torch.float32
+    # device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # # device = 'cpu'
 
-    def get_inputs(dtype):
-        torch.manual_seed(0)
-        # Create inputs
-        xq = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-        xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-        xv = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    # def get_inputs(dtype):
+    #     torch.manual_seed(0)
+    #     # Create inputs
+    #     xq = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    #     xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    #     xv = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
-        eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous() * 0.1
-        last_eta = eta[:, :, :, -1, :, None].contiguous()
+    #     eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous() * 0.1
+    #     last_eta = eta[:, :, :, -1, :, None].contiguous()
 
-        ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
-        ttt_norm_bias = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+    #     ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+    #     ttt_norm_bias = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
 
-        W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-        b1 = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-        W2 = torch.randn(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-        b2 = torch.randn(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    #     W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    #     b1 = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    #     W2 = torch.randn(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    #     b2 = torch.randn(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
 
-        return xq, xk, xv, eta, last_eta, ttt_norm_weight, ttt_norm_bias, W1, b1, W2, b2
-
-    
-    XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
-
-    XQ_batch = XQ_batch.to(torch.bfloat16).contiguous()
-    XK_batch = XK_batch.to(torch.bfloat16).contiguous()
-    XV_batch = XV_batch.to(torch.bfloat16).contiguous()
-    last_eta = last_eta.to(torch.bfloat16).contiguous()
-
-    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous()
-    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous()
-    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous()
-    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous()
-    output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-    output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-
-    grad_L_W1_last = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-    grad_L_b1_last = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-    grad_L_W2_last = torch.randn(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-    grad_L_b2_last = torch.randn(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-    grad_L_XQW_mini_batch = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous() * 0.02
-
-    grad_L_ttt_norm_weight = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
-    grad_L_ttt_norm_bias = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
-    grad_L_W1_init = torch.empty(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_b1_init = torch.empty(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_W2_init = torch.empty(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_b2_init = torch.empty(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_XQ = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
-    grad_L_XK = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
-    grad_L_XV = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
-    grad_L_last_eta = torch.empty_like(last_eta).contiguous()
-
-    # TK rematted values
-    W1_init_group = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
-    b1_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
-    W2_init_group = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
-    b2_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
-
-    x_hat_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    std_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
-
-    X2_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    Z1_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    X2_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-
-    grad_l_wrt_Z2_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    grad_l_wrt_Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    grad_x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    grad_output_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    std_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
-
-    # Ref rematted values
-    W1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
-    b1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
-    W2_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
-    b2_init_group_ref = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
-
-    x_hat_ln_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    std_ln_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
-
-    X2_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    Z1_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    Z1_bar_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    X2_bar_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-
-    grad_l_wrt_Z2_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    grad_l_wrt_Z1_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    x_hat_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    grad_x_hat_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    grad_output_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    std_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
-
-
-
-
-
-    thunderkittens.ttt_backward(
-        # Inputs
-        XQ_batch,
-        XK_batch,
-        XV_batch,
-        last_eta,
-        ttt_norm_weight,
-        ttt_norm_bias,
-        W1_init,
-        b1_init,
-        W2_init,
-        b2_init,
-        # Checkpoints
-        W1_checkpoints,
-        b1_checkpoints,
-        W2_checkpoints,
-        b2_checkpoints,
-        output_tk,
-        # Rematted Buffers
-        W1_init_group,
-        b1_init_group,
-        W2_init_group,
-        b2_init_group,
-        x_hat_ln_group,
-        std_ln_group,
-        X2_group,
-        Z1_group,
-        Z1_bar_group,
-        X2_bar_group,
-        grad_l_wrt_Z2_group,
-        grad_l_wrt_Z1_group,
-        x_hat_fused_group,
-        grad_x_hat_fused_group,
-        grad_output_fused_group,
-        std_fused_group,
-        # Upstream grads
-        grad_L_W1_last,
-        grad_L_b1_last,
-        grad_L_W2_last,
-        grad_L_b2_last,
-        grad_L_XQW_mini_batch,
-        # Output grads
-        grad_L_ttt_norm_weight,
-        grad_L_ttt_norm_bias,
-        grad_L_W1_init,
-        grad_L_b1_init,
-        grad_L_W2_init,
-        grad_L_b2_init,
-        grad_L_last_eta,
-        grad_L_XQ,
-        grad_L_XK,
-        grad_L_XV
-    )
-
-    XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
+    #     return xq, xk, xv, eta, last_eta, ttt_norm_weight, ttt_norm_bias, W1, b1, W2, b2
 
     
+    # XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
 
-    # Compute mini-batches for PyTorch
-    for checkpoint_idx in range(K-1, -1, -1):
+    # XQ_batch = XQ_batch.to(torch.bfloat16).contiguous()
+    # XK_batch = XK_batch.to(torch.bfloat16).contiguous()
+    # XV_batch = XV_batch.to(torch.bfloat16).contiguous()
+    # last_eta = last_eta.to(torch.bfloat16).contiguous()
 
-        W1_curr, b1_curr, W2_curr, b2_curr = (
-            W1_checkpoints[:, :, checkpoint_idx], 
-            b1_checkpoints[:, :, checkpoint_idx], 
-            W2_checkpoints[:, :, checkpoint_idx], 
-            b2_checkpoints[:, :, checkpoint_idx]
-        )
+    # W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous()
+    # b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous()
+    # W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous()
+    # b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    # output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    # output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
-        for i in range(checkpoint_group_size):
-            global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + i
-            xq_mb = XQ_batch[:,:,global_mini_batch_idx]
-            xk_mb = XK_batch[:,:,global_mini_batch_idx]
-            xv_mb = XV_batch[:,:,global_mini_batch_idx]
-            eta_mb = eta_batch[:, :, global_mini_batch_idx]
+    # grad_L_W1_last = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    # grad_L_b1_last = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    # grad_L_W2_last = torch.randn(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    # grad_L_b2_last = torch.randn(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    # grad_L_XQW_mini_batch = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous() * 0.02
 
-            (
-                output_ref[:, :, global_mini_batch_idx],
-                W1_curr,
-                b1_curr,
-                W2_curr,
-                b2_curr,
-                Z1_group_ref[:,:,i],
-                std_fused_group_ref[:,:,i],
-                x_hat_fused_group_ref[:,:,i],
-                grad_output_fused_group_ref[:,:,i],
-                grad_x_hat_fused_group_ref[:,:,i],
-                grad_l_wrt_Z2_group_ref[:,:,i],
-                grad_l_wrt_Z1_group_ref[:,:,i],
-                # Dual Form
-                X2_group_ref[:,:,i],
-                Z1_bar_group_ref[:,:,i],
-                X2_bar_group_ref[:,:,i],
-                # LN
-                std_ln_group_ref[:,:,i],
-                x_hat_ln_group_ref[:,:,i],
-            ) = compute_mini_batch_no_dual(
-                W1_curr, 
-                b1_curr, 
-                W2_curr, 
-                b2_curr, 
-                xq_mb, 
-                xk_mb, 
-                xv_mb, 
-                eta_mb,
-                ttt_norm_weight,
-                ttt_norm_bias
-            )
+    # grad_L_ttt_norm_weight = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    # grad_L_ttt_norm_bias = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    # grad_L_W1_init = torch.empty(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous()
+    # grad_L_b1_init = torch.empty(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous()
+    # grad_L_W2_init = torch.empty(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous()
+    # grad_L_b2_init = torch.empty(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous()
+    # grad_L_XQ = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    # grad_L_XK = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    # grad_L_XV = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    # grad_L_last_eta = torch.empty_like(last_eta).contiguous()
 
-            W1_init_group_ref[:,:,i] = W1_curr
-            b1_init_group_ref[:,:,i] = b1_curr
-            W2_init_group_ref[:,:,i] = W2_curr
-            b2_init_group_ref[:,:,i] = b2_curr
+    # # TK rematted values
+    # W1_init_group = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
+    # b1_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
+    # W2_init_group = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
+    # b2_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
+
+    # x_hat_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
+    # std_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+
+    # X2_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
+    # Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
+    # Z1_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
+    # X2_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
+
+    # grad_l_wrt_Z2_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
+    # grad_l_wrt_Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
+    # x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
+    # grad_x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
+    # grad_output_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
+    # std_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+
+    # # Ref rematted values
+    # W1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
+    # b1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
+    # W2_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
+    # b2_init_group_ref = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
+
+    # x_hat_ln_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    # std_ln_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+
+    # X2_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    # Z1_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    # Z1_bar_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    # X2_bar_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+
+    # grad_l_wrt_Z2_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    # grad_l_wrt_Z1_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    # x_hat_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    # grad_x_hat_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    # grad_output_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    # std_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
 
 
 
-    # breakpoint()
 
-    gradients_to_compare = [
-        # W1_init_group
-        (W1_init_group, W1_init_group_ref, "W1_init_group"),
-        (b1_init_group, b1_init_group_ref, "b1_init_group"),
-        (W2_init_group, W2_init_group_ref, "W2_init_group"),
-        (b2_init_group, b2_init_group_ref, "b2_init_group"),
 
-        # Layer Norm Groups
-        (x_hat_ln_group, x_hat_ln_group_ref, "x_hat_ln_group"),
-        (std_ln_group, std_ln_group_ref, "std_ln_group"),
+    # thunderkittens.ttt_backward(
+    #     # Inputs
+    #     XQ_batch,
+    #     XK_batch,
+    #     XV_batch,
+    #     last_eta,
+    #     ttt_norm_weight,
+    #     ttt_norm_bias,
+    #     W1_init,
+    #     b1_init,
+    #     W2_init,
+    #     b2_init,
+    #     # Checkpoints
+    #     W1_checkpoints,
+    #     b1_checkpoints,
+    #     W2_checkpoints,
+    #     b2_checkpoints,
+    #     output_tk,
+    #     # Rematted Buffers
+    #     W1_init_group,
+    #     b1_init_group,
+    #     W2_init_group,
+    #     b2_init_group,
+    #     x_hat_ln_group,
+    #     std_ln_group,
+    #     X2_group,
+    #     Z1_group,
+    #     Z1_bar_group,
+    #     X2_bar_group,
+    #     grad_l_wrt_Z2_group,
+    #     grad_l_wrt_Z1_group,
+    #     x_hat_fused_group,
+    #     grad_x_hat_fused_group,
+    #     grad_output_fused_group,
+    #     std_fused_group,
+    #     # Upstream grads
+    #     grad_L_W1_last,
+    #     grad_L_b1_last,
+    #     grad_L_W2_last,
+    #     grad_L_b2_last,
+    #     grad_L_XQW_mini_batch,
+    #     # Output grads
+    #     grad_L_ttt_norm_weight,
+    #     grad_L_ttt_norm_bias,
+    #     grad_L_W1_init,
+    #     grad_L_b1_init,
+    #     grad_L_W2_init,
+    #     grad_L_b2_init,
+    #     grad_L_last_eta,
+    #     grad_L_XQ,
+    #     grad_L_XK,
+    #     grad_L_XV
+    # )
 
-        # Intermediate Computations
-        (X2_group, X2_group_ref, "X2_group"),
-        (Z1_group, Z1_group_ref, "Z1_group"),
-        (Z1_bar_group, Z1_bar_group_ref, "Z1_bar_group"),
-        (X2_bar_group, X2_bar_group_ref, "X2_bar_group"),
+    # XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
 
-        # Gradients
-        (grad_l_wrt_Z2_group, grad_l_wrt_Z2_group_ref, "grad_l_wrt_Z2_group"),
-        (grad_l_wrt_Z1_group, grad_l_wrt_Z1_group_ref, "grad_l_wrt_Z1_group"),
-        (x_hat_fused_group, x_hat_fused_group_ref, "x_hat_fused_group"),
-        (grad_x_hat_fused_group, grad_x_hat_fused_group_ref, "grad_x_hat_fused_group"),
-        (grad_output_fused_group, grad_output_fused_group_ref, "grad_output_fused_group"),
-        (std_fused_group, std_fused_group_ref, "std_fused_group")
-    ]
+    
 
-    # Execute the comparison
-    compare_all_grads(gradients_to_compare)
+    # # Compute mini-batches for PyTorch
+    # for checkpoint_idx in range(K-1, -1, -1):
+
+    #     W1_curr, b1_curr, W2_curr, b2_curr = (
+    #         W1_checkpoints[:, :, checkpoint_idx], 
+    #         b1_checkpoints[:, :, checkpoint_idx], 
+    #         W2_checkpoints[:, :, checkpoint_idx], 
+    #         b2_checkpoints[:, :, checkpoint_idx]
+    #     )
+
+    #     for i in range(checkpoint_group_size):
+    #         global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + i
+    #         xq_mb = XQ_batch[:,:,global_mini_batch_idx]
+    #         xk_mb = XK_batch[:,:,global_mini_batch_idx]
+    #         xv_mb = XV_batch[:,:,global_mini_batch_idx]
+    #         eta_mb = eta_batch[:, :, global_mini_batch_idx]
+
+    #         (
+    #             output_ref[:, :, global_mini_batch_idx],
+    #             W1_curr,
+    #             b1_curr,
+    #             W2_curr,
+    #             b2_curr,
+    #             Z1_group_ref[:,:,i],
+    #             std_fused_group_ref[:,:,i],
+    #             x_hat_fused_group_ref[:,:,i],
+    #             grad_output_fused_group_ref[:,:,i],
+    #             grad_x_hat_fused_group_ref[:,:,i],
+    #             grad_l_wrt_Z2_group_ref[:,:,i],
+    #             grad_l_wrt_Z1_group_ref[:,:,i],
+    #             # Dual Form
+    #             X2_group_ref[:,:,i],
+    #             Z1_bar_group_ref[:,:,i],
+    #             X2_bar_group_ref[:,:,i],
+    #             # LN
+    #             std_ln_group_ref[:,:,i],
+    #             x_hat_ln_group_ref[:,:,i],
+    #         ) = compute_mini_batch_no_dual(
+    #             W1_curr, 
+    #             b1_curr, 
+    #             W2_curr, 
+    #             b2_curr, 
+    #             xq_mb, 
+    #             xk_mb, 
+    #             xv_mb, 
+    #             eta_mb,
+    #             ttt_norm_weight,
+    #             ttt_norm_bias
+    #         )
+
+    #         W1_init_group_ref[:,:,i] = W1_curr
+    #         b1_init_group_ref[:,:,i] = b1_curr
+    #         W2_init_group_ref[:,:,i] = W2_curr
+    #         b2_init_group_ref[:,:,i] = b2_curr
+
+
+
+    # # breakpoint()
+
+    # gradients_to_compare = [
+    #     # W1_init_group
+    #     (W1_init_group, W1_init_group_ref, "W1_init_group"),
+    #     (b1_init_group, b1_init_group_ref, "b1_init_group"),
+    #     (W2_init_group, W2_init_group_ref, "W2_init_group"),
+    #     (b2_init_group, b2_init_group_ref, "b2_init_group"),
+
+    #     # Layer Norm Groups
+    #     (x_hat_ln_group, x_hat_ln_group_ref, "x_hat_ln_group"),
+    #     (std_ln_group, std_ln_group_ref, "std_ln_group"),
+
+    #     # Intermediate Computations
+    #     (X2_group, X2_group_ref, "X2_group"),
+    #     (Z1_group, Z1_group_ref, "Z1_group"),
+    #     (Z1_bar_group, Z1_bar_group_ref, "Z1_bar_group"),
+    #     (X2_bar_group, X2_bar_group_ref, "X2_bar_group"),
+
+    #     # Gradients
+    #     (grad_l_wrt_Z2_group, grad_l_wrt_Z2_group_ref, "grad_l_wrt_Z2_group"),
+    #     (grad_l_wrt_Z1_group, grad_l_wrt_Z1_group_ref, "grad_l_wrt_Z1_group"),
+    #     (x_hat_fused_group, x_hat_fused_group_ref, "x_hat_fused_group"),
+    #     (grad_x_hat_fused_group, grad_x_hat_fused_group_ref, "grad_x_hat_fused_group"),
+    #     (grad_output_fused_group, grad_output_fused_group_ref, "grad_output_fused_group"),
+    #     (std_fused_group, std_fused_group_ref, "std_fused_group")
+    # ]
+
+    # # Execute the comparison
+    # compare_all_grads(gradients_to_compare)
 
 
 
@@ -877,7 +886,7 @@ def kernel_with_timeout(kernel_function, timeout=10):
     print("Kernel execution completed within the timeout.")
 
 if __name__ == '__main__':
-    is_lock_protected = True
+    is_lock_protected = False
 
     if not is_lock_protected:
         main()
