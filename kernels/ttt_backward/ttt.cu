@@ -205,7 +205,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     }
     else
     {
-        warpgroup::increase_registers<240>(); // consumer needs all of the registers
+        warpgroup::increase_registers<256>(); // consumer needs all of the registers
     }
     
 
@@ -237,19 +237,39 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     CS_F_tile_type(&cs_f_store2_smem) = al.allocate<CS_F_tile_type>();
 
     // Backward-backward smem
-    F_F_tile_acc_type(&grad_L_w1_smem) = al.allocate<F_F_tile_acc_type>();
+    F_F_tile_acc_type(&grad_L_W1_smem) = al.allocate<F_F_tile_acc_type>();
     F_vec_acc_type(&grad_L_b1_smem) = al.allocate<F_vec_acc_type>();
-    F_F_tile_acc_type(&grad_L_w2_smem) = al.allocate<F_F_tile_acc_type>();
+    F_F_tile_acc_type(&grad_L_W2_smem) = al.allocate<F_F_tile_acc_type>();
     F_vec_acc_type(&grad_L_b2_smem) = al.allocate<F_vec_acc_type>();
 
-    CS_vec_type(&grad_L_last_eta) = al.allocate<CS_vec_type>();
+    CS_vec_type(&grad_L_last_eta_smem) = al.allocate<CS_vec_type>();
 
     auto(&grad_L_XQW_mini_batch_smem)[K::stages] = v_smem;
-    auto(&x_hat_ln_smem) = z1_smem;
+    auto(&x_hat_ln_smem) = z1_smem; //
     auto(&std_ln_smem)[4] = ln_smem;
-    auto(&Z1_bar_smem) = x2_smem;
     auto(&grad_L_Z2_bar_smem) = grad_l_z1_smem;
+    auto(&z1_bar_smem) = x2_smem;
     auto(&grad_L_Z1_bar_smem) = x2_smem;
+    auto(&x2_bar_smem) = z1_smem;
+    auto(&grad_l_wrt_Z2_smem) = grad_l_z1_smem; //
+    auto(&x2_bwd_smem) = grad_l_z1_smem;
+    auto(&grad_l_wrt_Z1_smem) = grad_l_z1_smem;
+    auto(&grad_L_grad_l_wrt_Z1_smem) = grad_l_z1_smem;
+    auto(&grad_L_grad_l_wrt_Z2_smem) = grad_l_z1_smem;
+    auto(&z1_bwd_smem) = grad_l_z1_smem;
+    auto(&x_hat_fused_smem) = grad_l_z1_smem;
+    auto(&grad_L_grad_x_hat_fused_smem) = grad_l_z1_smem;
+    auto(&grad_L_reconstruction_target_smem) = grad_l_z1_smem;
+    auto(&grad_L_x_hat_fused_smem) = grad_l_z1_smem;
+    auto(&grad_x_hat_fused_smem) = grad_l_z1_smem;
+    auto(&grad_L_Z2_smem) = grad_l_z1_smem;
+    auto(&grad_L_Z1_smem) = grad_l_z1_smem;
+    auto(&grad_L_XK_smem) = grad_l_z1_smem;
+
+    // auto(&grad_L_Z1_bar_smem)
+
+    // cs_f_store_smem
+    // cs_f_store2_smem
     // auto(&grad_L_ln_bias_ln) = z1_smem;
 
 
@@ -277,9 +297,14 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         second_dsmem_semaphore1,
         second_dsmem_semaphore2,
         x_hat_ln_arrived,
-        std_ln_arrived;
+        std_ln_arrived,
+        z1_bar_group_arrived,
+        w1_remat_smem_arrived,
+        b1_remat_smem_arrived,
+        w2_remat_smem_arrived,
+        b2_remat_smem_arrived;
 
-    kittens::semaphore& grad_L_XQW_mini_batch_sem_arrived[K::stages] = v_sem_arrived;
+    kittens::semaphore(&grad_L_XQW_mini_batch_sem_arrived)[K::stages] = v_sem_arrived;
 
     if (threadIdx.x == 0) {
         init_semaphore(w1_arrived, 0, 1);
@@ -689,8 +714,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                         kittens::wait(compute_done[last_idx % K::stages], (last_idx / K::stages) % 2);
                     }
                     
-                    tma::expect_bytes(grad_L_XQW_mini_batch_sem_arrived[curr_stage], sizeof(grad_L_XQW_mini_batch[0]));
-                    tma::load_async(grad_L_XQW_mini_batch[curr_stage], g.grad_L_XQW_mini_batch, tile_idx, grad_L_XQW_mini_batch_sem_arrived[curr_stage]);
+                    tma::expect_bytes(grad_L_XQW_mini_batch_sem_arrived[curr_stage], sizeof(grad_L_XQW_mini_batch_smem[0]));
+                    tma::load_async(grad_L_XQW_mini_batch_smem[curr_stage], g.grad_L_XQW_mini_batch, tile_idx, grad_L_XQW_mini_batch_sem_arrived[curr_stage]);
                     tma::expect_bytes(k_sem_arrived[curr_stage], sizeof(k_smem[0]));
                     tma::load_async(k_smem[curr_stage], g.k, tile_idx, k_sem_arrived[curr_stage]);
                     tma::expect_bytes(q_sem_arrived[curr_stage], sizeof(q_smem[0]));
@@ -752,10 +777,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
 
                 // grad_L_Z1_bar
-                warpgroup::load(cs_cs_fl_reg2, W2_smem);
+                warpgroup::load(cs_cs_fl_reg2, w2_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 zero(cs_cs_fl_reg);
-                warpgroup::mma_ABt(cs_cs_fl_reg, grad_L_Z2_bar, matmul_smem); // grad_L_X2_bar
+                warpgroup::mma_ABt(cs_cs_fl_reg, grad_L_Z2_bar_smem, matmul_smem); // grad_L_X2_bar
 
                 tma::expect_bytes(z1_bar_group_arrived, sizeof(z1_bar_smem));
                 tma::load_async(z1_bar_smem, g.Z1_bar_group, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank}, z1_bar_group_arrived);
@@ -767,20 +792,20 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::store(grad_L_Z1_bar_smem, cs_cs_fl_reg);
 
                 // grad_L_W1_last
-                warpgroup::load(cs_cs_fl_reg2, grad_L_W1_last);
-                kittens::wait(q_sem_arrived, semaphore_phase);
+                warpgroup::load(cs_cs_fl_reg2, grad_L_W1_smem);
+                kittens::wait(q_sem_arrived[curr_stage], semaphore_phase);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::mma_AtB(cs_cs_fl_reg2, q_smem[curr_stage], grad_L_Z1_bar_smem);
 
                 // grad_L_b1_last
                 warpgroup::store(b_acc_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
-                warpgroup::col_sum(grad_L_b1_init, b_acc_smem, grad_L_b1_init);
+                warpgroup::col_sum(grad_L_b1_smem, b_acc_smem, grad_L_b1_smem);
                 warpgroup::mma_async_wait();
 
                 // grad_L_W2_last
-                warpgroup::load(cs_cs_fl_reg2, grad_L_W2_last);
-                kittens::wait(q_sem_arrived, semaphore_phase);
+                warpgroup::load(cs_cs_fl_reg2, grad_L_W2_smem);
+                kittens::wait(q_sem_arrived[curr_stage], semaphore_phase);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::mma_AtB(cs_cs_fl_reg2, x2_bar_smem, grad_L_Z2_bar_smem);
 
@@ -788,16 +813,18 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg, grad_L_Z2_bar_smem);
                 warpgroup::store(b_acc_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
-                warpgroup::col_sum(grad_L_b2_init, b_acc_smem, grad_L_b2_init);
+                warpgroup::col_sum(grad_L_b2_smem, b_acc_smem, grad_L_b2_smem);
                 warpgroup::mma_async_wait();
 
 
                 // grad_L_XQ_mini_batch
                 warpgroup::load(cs_cs_fl_reg, grad_L_XQW_mini_batch_smem[curr_stage]);
-                warpgroup::mma_ABt(cs_cs_fl_reg, grad_L_Z1_bar_smem, w1_smem);
+                warpgroup::load(cs_cs_fl_reg, w1_smem);
+                warpgroup::store(matmul_smem, cs_cs_fl_reg);
+                warpgroup::mma_ABt(cs_cs_fl_reg, grad_L_Z1_bar_smem, matmul_smem);
                 warpgroup::mma_async_wait();
 
-                warpgroup::store(cs_cs_fl_reg, matmul_smem);
+                warpgroup::store(matmul_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
 
                 // needs a tp reduce
@@ -810,30 +837,36 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 // grad_L_last_eta_in_mini_batch
                 zero(cs_cs_fl_reg);
-                warpgroup::mma_ABt(cs_cs_fl_reg, grad_l_wrt_Z2_smem, grad_L_W2_last);
-                warpgroup::load(cs_cs_fl_reg2, x2_smem);
+                warpgroup::load(cs_cs_fl_reg, grad_L_W2_smem);
+                warpgroup::store(matmul_smem, cs_cs_fl_reg);
+                warpgroup::sync(warpgroupid+1);
+                warpgroup::mma_ABt(cs_cs_fl_reg, grad_l_wrt_Z2_smem, matmul_smem);
+                warpgroup::load(cs_cs_fl_reg2, x2_bwd_smem);
                 zero(cs_col_fl_reg);
                 warpgroup::mma_async_wait();
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 row_sum(cs_col_fl_reg2, cs_cs_fl_reg);
-                store(grad_L_last_eta, cs_col_fl_reg); // first line
+                store(grad_L_last_eta_smem, cs_col_fl_reg); // first line
 
-                load(cs_col_fl_reg, grad_L_b2_last);
-                load(cs_cs_fl_reg, grad_L_wrt_Z2_smem);
+                load(cs_col_fl_reg, grad_L_b2_smem);
+                load(cs_cs_fl_reg, grad_l_wrt_Z2_smem);
                 mul_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 add(cs_col_fl_reg2, cs_col_fl_reg2, cs_col_fl_reg); // second line
 
                 zero(cs_cs_fl_reg);
-                warpgroup::mma_ABt(cs_cs_fl_reg, grad_l_wrt_Z1_smem, grad_L_W1_init_smem);
+                warpgroup::load(cs_cs_fl_reg, grad_L_W1_smem);
+                warpgroup::store(matmul_smem, cs_cs_fl_reg);
+                warpgroup::sync(warpgroupid+1);
+                warpgroup::mma_ABt(cs_cs_fl_reg, grad_l_wrt_Z1_smem, matmul_smem);
                 warpgroup::load(cs_cs_fl_reg2, k_smem[curr_stage]);
                 warpgroup::mma_async_wait();
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 add(cs_col_fl_reg2, cs_col_fl_reg2, cs_col_fl_reg); // third line
 
-                load(cs_col_fl_reg, grad_L_b1_init);
-                load(cs_cs_fl_reg, grad_l_wrt_Z1);
+                load(cs_col_fl_reg, grad_L_b1_smem);
+                load(cs_cs_fl_reg, grad_l_wrt_Z1_smem);
                 mul_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 add(cs_col_fl_reg2, cs_col_fl_reg2, cs_col_fl_reg);
@@ -845,12 +878,12 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 // grad_L_grad_l_wrt_Z1
                 warpgroup::mul_col(cs_f_store_smem, last_eta_smem[curr_stage], k_smem[curr_stage]);
-                warpgroup::load(cs_cs_fl_reg, grad_L_W1_last);
+                warpgroup::load(cs_cs_fl_reg, grad_L_W1_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg);     
                 warpgroup::sync(warpgroupid+1);       
                 zero(cs_cs_fl_reg);
                 warpgroup::mma_AB(cs_cs_fl_reg, cs_f_store_smem, matmul_smem);
-                load(cs_col_fl_reg, grad_L_b1_init_smem);
+                load(cs_col_fl_reg, grad_L_b1_smem);
                 broadcast_col(cs_cs_fl_reg2, cs_col_fl_reg);
                 load(cs_col_fl_reg, last_eta_smem);
                 mul_col(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
@@ -860,13 +893,13 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::store(grad_L_grad_l_wrt_Z1_smem, cs_cs_fl_reg);
 
                 // grad_L_grad_l_wrt_Z2
-                warpgroup::mul_col(cs_f_store_smem, last_eta_smem[curr_stage], x2_smem[curr_stage]);
-                warpgroup::load(cs_cs_fl_reg, grad_L_W2_last);
+                warpgroup::mul_col(cs_f_store_smem, last_eta_smem[curr_stage], x2_bwd_smem);
+                warpgroup::load(cs_cs_fl_reg, grad_L_W2_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg);     
                 warpgroup::sync(warpgroupid+1);       
                 zero(cs_cs_fl_reg);
                 warpgroup::mma_AB(cs_cs_fl_reg, cs_f_store_smem, matmul_smem);
-                load(cs_col_fl_reg, grad_L_b2_init_smem);
+                load(cs_col_fl_reg, grad_L_b2_smem);
                 broadcast_col(cs_cs_fl_reg2, cs_col_fl_reg);
                 load(cs_col_fl_reg, last_eta_smem);
                 mul_col(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
@@ -876,15 +909,15 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::store(grad_L_grad_l_wrt_Z2_smem, cs_cs_fl_reg);
 
                 warpgroup::load(cs_cs_fl_reg, grad_L_grad_l_wrt_Z1_smem);
-                warpgroup::load(cs_cs_fl_reg2, z1_smem);
+                warpgroup::load(cs_cs_fl_reg2, z1_bwd_smem);
                 gelu_bwd(cs_cs_fl_reg2, cs_cs_fl_reg2);
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 warpgroup::load(cs_cs_fl_reg2, w2_smem);
                 warpgroup::store(matmul_smem, w2_smem);
-                warpgroup::store(cs_f_store_smem2, cs_cs_fl_reg);
+                warpgroup::store(cs_f_store2_smem, cs_cs_fl_reg);
                 zero(cs_cs_fl_reg2);
                 warpgroup::sync(warpgroupid+1);
-                warpgroup::mma_AB(cs_cs_fl_reg2, cs_f_store_smem2, matmul_smem);
+                warpgroup::mma_AB(cs_cs_fl_reg2, cs_f_store2_smem, matmul_smem);
                 warpgroup::load(cs_cs_fl_reg, grad_L_grad_l_wrt_Z2_smem);
                 warpgroup::mma_async_wait();
 
@@ -906,7 +939,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 // grad_L_XK_mini_batch
                 zero(cs_cs_fl_reg);
-                warpgroup::load(cs_cs_fl_reg2, grad_L_W1_last);
+                warpgroup::load(cs_cs_fl_reg2, grad_L_W1_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 warpgroup::mma_ABt(cs_cs_fl_reg, grad_l_wrt_Z1_smem, matmul_smem);
                 load(cs_col_fl_reg, last_eta_smem);
@@ -916,32 +949,32 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 tma::store_add_async(g.grad_L_XK, cs_f_store_smem, {batch_idx, head_idx, global_mini_batch_idx, 0});  // TODO: Needs tp maybe?
 
                 // grad_L_grad_x_hat_fused
-                warpgroup::load(cs_cs_fl_reg, grad_L_grad_l_wrt_Z2);
+                warpgroup::load(cs_cs_fl_reg, grad_L_grad_l_wrt_Z2_smem);
                 warpgroup::load(cs_cs_fl_reg2, x_hat_fused_smem); // TODO: Add tma load
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 add_row(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
 
-                warpgroup::load(cs_cs_fl_reg, grad_L_grad_l_wrt_Z2);
+                warpgroup::load(cs_cs_fl_reg, grad_L_grad_l_wrt_Z2_smem);
                 zero(cs_col_fl_reg2);
-                row_sum(cs_col_fl_reg2, cs_cs_fl_reg)
+                row_sum(cs_col_fl_reg2, cs_cs_fl_reg);
                 mul_col(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg2);
                 div(cs_cs_fl_reg2, cs_cs_fl_reg2, static_cast<float>(-1*head_dim));
 
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 load(cs_col_fl_reg, ln_smem[wg_warpid]); // TODO: Load std_fused from tma
                 div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
-                warpgroup::store(grad_L_grad_x_hat_fused, cs_cs_fl_reg);
+                warpgroup::store(grad_L_grad_x_hat_fused_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
 
                 // grad_L_reconstruction_target
                 load(cs_row_fl_reg, ttt_norm_weight_smem);
                 mul_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
-                warpgroup::store(grad_L_reconstruction_target, cs_cs_fl_reg2);
+                warpgroup::store(grad_L_reconstruction_target_smem, cs_cs_fl_reg2);
                 mul(cs_cs_fl_reg2, cs_cs_fl_reg, -1.0f);
                 warpgroup::store(cs_f_store_smem, cs_cs_fl_reg2);
 
-                tma::store_add_async(g.grad_L_XV, grad_L_reconstruction_target, {})
+                tma::store_add_async(g.grad_L_XV, grad_L_reconstruction_target_smem, {});
                 tma::store_add_async(g.grad_L_XK, cs_f_store_smem, {});
                 
 
@@ -975,7 +1008,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 // grad_L_std
                 warpgroup::load(cs_cs_fl_reg2, x_hat_fused_smem);
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
-                warpgroup::mul(grad_L_grad_l_wrt_Z2_smem, grad_L_grad_l_wrt_Z2_smem, grad_l_wrt_Z2);
+                warpgroup::mul(grad_L_grad_l_wrt_Z2_smem, grad_L_grad_l_wrt_Z2_smem, grad_l_wrt_Z2_smem);
                 warpgroup::load(cs_cs_fl_reg2, grad_L_grad_l_wrt_Z2_smem);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 load(cs_col_fl_reg, ln_smem[wg_warpid]);
@@ -986,13 +1019,13 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg2, x_hat_fused_smem);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 mul_col(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
-                warpgroup::load(cs_cs_fl_reg, grad_L_x_hat_fused);
+                warpgroup::load(cs_cs_fl_reg, grad_L_x_hat_fused_smem);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 load(cs_col_fl_reg2, ln_smem[wg_warpid]); 
                 div(cs_col_fl_reg, cs_col_fl_reg, cs_col_fl_reg2); // TODO: This might cause problems
                 sub_row(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
                 div(cs_cs_fl_reg2, cs_cs_fl_reg2, static_cast<float>(head_dim));
-                warpgroup::load(cs_cs_fl_reg, grad_L_x_hat_fused);
+                warpgroup::load(cs_cs_fl_reg, grad_L_x_hat_fused_smem);
                 div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg2);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 warpgroup::store(grad_L_Z2_smem, cs_cs_fl_reg);
@@ -1000,10 +1033,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 // grad_L_X2
                 zero(cs_cs_fl_reg);
-                kittens::wait(w2_remat_smem_arrived);
+                kittens::wait(w2_remat_smem_arrived, semaphore_phase);
                 warpgroup::mma_ABt(cs_cs_fl_reg, grad_L_Z2_smem, w2_smem);
                 
-                warpgroup::load(cs_cs_fl_reg2, grad_L_W2_last_smem);
+                warpgroup::load(cs_cs_fl_reg2, grad_L_W2_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 zero(cs_cs_fl_reg2);
                 warpgroup::sync(warpgroupid+1);
@@ -1014,34 +1047,34 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 sub(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
 
                 // grad_L_W2_init
-                warpgroup::load(cs_cs_fl_reg2, z1_smem);
+                warpgroup::load(cs_cs_fl_reg2, z1_bwd_smem);
                 gelu_bwd(cs_cs_fl_reg2, cs_cs_fl_reg2);
                 warpgroup::store(cs_f_store_smem, cs_cs_fl_reg2);
-                warpgroup::mul(cs_f_store_smem, cs_f_store_smem, grad_L_grad_l_wrt_Z1);
-                warpgroup::load(cs_cs_fl_reg2, grad_L_w2_smem);
+                warpgroup::mul(cs_f_store_smem, cs_f_store_smem, grad_L_grad_l_wrt_Z1_smem);
+                warpgroup::load(cs_cs_fl_reg2, grad_L_W2_smem);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::mma_AtB(cs_cs_fl_reg2, cs_f_store_smem, grad_l_wrt_Z2_smem);
                 warpgroup::mma_async_wait();
                 warpgroup::store(grad_L_W2_smem, cs_cs_fl_reg2);
 
                 // grad_L_Z1
-                warpgroup::load(cs_cs_fl_reg2, z1_smem);
+                warpgroup::load(cs_cs_fl_reg2, z1_bwd_smem);
                 gelu_bwd(cs_cs_fl_reg2, cs_cs_fl_reg2);
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 
                 warpgroup::load(cs_cs_fl_reg2, w2_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 zero(cs_cs_fl_reg2);
-                warpgroup::sync(warpgroupid+1)
+                warpgroup::sync(warpgroupid+1);
                 warpgroup::mma_ABt(cs_cs_fl_reg2, grad_l_wrt_Z2_smem, matmul_smem);
-                warpgroup::gelu_bwd_bwd(z1_smem, z1_smem);
-                warpgroup::mul(grad_L_grad_l_wrt_Z1_smem, grad_L_grad_l_wrt_Z1_smem, z1_smem);
+                warpgroup::gelu_bwd_bwd(z1_bwd_smem, z1_bwd_smem);
+                warpgroup::mul(grad_L_grad_l_wrt_Z1_smem, grad_L_grad_l_wrt_Z1_smem, z1_bwd_smem);
                 warpgroup::mma_async_wait();
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 warpgroup::mul(matmul_smem, matmul_smem, grad_L_grad_l_wrt_Z1_smem);
-                warpgroup::load(cs_cs_fl_reg2, matmul_smem)
+                warpgroup::load(cs_cs_fl_reg2, matmul_smem);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
-                warpgroup::store(grad_L_Z1, cs_cs_fl_reg);
+                warpgroup::store(grad_L_Z1_smem, cs_cs_fl_reg);
 
                 warpgroup::sync(warpgroupid+1);
 
@@ -1062,7 +1095,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 }
 
                 warpgroup::load(cs_cs_fl_reg, grad_L_W2_smem);
-                warpgroup::mma_AtB(cs_cs_fl_reg, x2_smem, grad_L_Z2_smem);
+                warpgroup::mma_AtB(cs_cs_fl_reg, x2_bwd_smem, grad_L_Z2_smem);
                 warpgroup::load(cs_cs_fl_reg2, grad_L_Z2_smem);
                 sum_col(cs_row_fl_reg, cs_cs_fl_reg2); // TODO: Fix this
                 warpgroup::load(cs_col_fl_reg, grad_L_b2_smem);
