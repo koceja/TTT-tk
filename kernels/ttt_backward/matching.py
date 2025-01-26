@@ -19,7 +19,7 @@ def compare_all_grads(gradients_to_compare):
             nonzero_mask = grad_ref != 0
             relative_error = torch.zeros_like(grad_ref)
             relative_error[nonzero_mask] = abs_diff[nonzero_mask] / torch.abs(grad_ref[nonzero_mask])
-            
+            max_relative_error = torch.max(relative_error[nonzero_mask]).item() if torch.any(nonzero_mask) else float('inf')
             median_relative_error = torch.median(relative_error[nonzero_mask]).item() if torch.any(nonzero_mask) else float('inf')
 
         # Format values to 10 digits total
@@ -27,11 +27,12 @@ def compare_all_grads(gradients_to_compare):
             name,
             f"{max_diff:.10g}",
             f"{median_diff:.10g}",
+            f"{max_relative_error:.10g}",
             f"{median_relative_error:.10g}"
         ))
 
     # Prepare data for tabulation
-    table_data = [["Metric", "Max Difference", "Median Difference", "Median Relative Error"]] + results
+    table_data = [["Metric", "Max Difference", "Median Difference", "Max Relative Error", "Median Relative Error"]] + results
 
     # Print the results using tabulate
     print("\nComparison Results:")
@@ -372,18 +373,9 @@ def backward(
         )
     )
 
-    # grad_L_std = -grad_L_x_hat_fused * ((x_hat_fused) / std_fused) - grad_L_grad_l_wrt_Z2 * (
-    #     grad_l_wrt_Z2 * std_fused
-    # ) / (std_fused**2)
     grad_L_std = (-grad_L_x_hat_fused * ((x_hat_fused)) - grad_L_grad_l_wrt_Z2 *
         grad_l_wrt_Z2
     ) / std_fused
-
-    # grad_L_Z2 = (
-    #     grad_L_x_hat_fused * (1.0 / std_fused)
-    #     - (1.0 / head_dim) * grad_L_x_hat_fused.sum(dim=-1, keepdim=True) * (1.0 / std_fused)
-    #     + (1.0 / head_dim) * (grad_L_std).sum(dim=-1, keepdim=True) * x_hat_fused
-    # )
 
     grad_L_Z2 = (
         grad_L_x_hat_fused * (1.0 / std_fused)
@@ -401,9 +393,13 @@ def backward(
     )
 
     # Stage 1: MatMul
+    # grad_L_X2 = (
+    #     grad_L_Z2 @ W2_init.transpose(-2, -1)
+    #     - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
+    # )
     grad_L_X2 = (
         grad_L_Z2 @ W2_init.transpose(-2, -1)
-        - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
+        # - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
     )
         
     grad_L_Z1 = grad_L_X2 * gelu_bwd(Z1) + (
@@ -411,7 +407,7 @@ def backward(
         ) * grad_L_grad_l_wrt_Z1 * gelu_bwd_derivative(Z1)
 
     grad_L_XQ = grad_L_XQW_mini_batch + grad_L_XQ_mini_batch
-    grad_L_XK = -grad_L_reconstruction_target + grad_L_XK_mini_batch + grad_L_Z1 @ W1_init.transpose(-2, -1)
+    grad_L_XK = -grad_L_reconstruction_target + grad_L_XK_mini_batch #+ grad_L_Z1 @ W1_init.transpose(-2, -1)
     grad_L_XV = grad_L_reconstruction_target
     
     grad_L_W2_states = grad_L_W2_last# + grad_L_W2_init + X2.transpose(-2, -1) @ grad_L_Z2
@@ -432,7 +428,7 @@ def backward(
         grad_L_XV,
         grad_L_XK,
         grad_L_eta,
-        grad_L_Z1_bar[:,:,:,:64]
+        grad_L_Z2
     )
 
 
@@ -670,9 +666,9 @@ def main():
     grad_L_W2_init = torch.empty(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous()
     grad_L_b2_init = torch.empty(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous()
     grad_L_XQ = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
-    grad_L_XK = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
-    grad_L_XV = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
-    grad_L_last_eta = torch.empty_like(last_eta).contiguous()
+    grad_L_XK = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    grad_L_XV = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    grad_L_last_eta = torch.zeros_like(last_eta).contiguous()
 
     # TK rematted values
     W1_init_group = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
@@ -911,6 +907,8 @@ def main():
             grad_L_W2_init_ref = grad_L_W2_curr
             grad_L_b2_init_ref = grad_L_b2_curr
 
+    grad_L_eta = torch.nn.functional.pad(grad_L_last_eta.transpose(-2, -1), (0, 0, 63, 0))
+
 
 
     # breakpoint()
@@ -944,6 +942,11 @@ def main():
         (grad_L_W2_init, grad_L_W2_init_ref, "grad_L_W2"),
         (grad_L_b2_init, grad_L_b2_init_ref, "grad_L_b2"),
         (grad_L_XQ, grad_L_XQ_ref, "grad_L_XQ"),
+        (grad_L_XK, grad_L_XK_ref, "grad_L_XK"),
+        (grad_L_XV, grad_L_XV_ref, "grad_L_XV"),
+        (grad_L_ttt_norm_weight, grad_L_ttt_norm_weight_ref, 'grad_L_ttt_norm_weight'),
+        (grad_L_ttt_norm_bias, grad_L_ttt_norm_bias_ref, 'grad_L_ttt_norm_bias'),
+        (grad_L_eta, grad_L_eta_ref, 'grad_L_eta'),
         (output_tk, output_ref, "Outputs")
     ]
 
