@@ -438,7 +438,7 @@ def backward(
         grad_L_XV,
         grad_L_XK,
         grad_L_eta,
-        (grad_L_Z1_bar)[:,:,:,:64]
+        (grad_L_Z1_bar)[:,:,:,192:]
     )
 
 
@@ -1882,11 +1882,11 @@ def main():
     # match_backward_pytorch()
     torch.manual_seed(0)
     # Define shapes
-    B = 1
+    B = 4
     NH = 48
-    K = 8
+    K = 1
     
-    seq_len = 32768
+    seq_len = 64
     mini_batch_size = 64
     CS = mini_batch_size
     NC = seq_len // mini_batch_size
