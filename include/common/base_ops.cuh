@@ -530,7 +530,7 @@ namespace gelu_helpers
         T term3 = mul::op(x, mul::op(tanh_out, mul::op(term2, term2)));
 
         // (1 - tanh_out * tanh_out) * (sqrt_2_over_pi + term1 - term2)
-        return mul::op(sub::op(coeff2, mul::op(tanh_out, tanh_out)), sum::op(sqrt_2_over_pi, sub::op(term1, term2)));
+        return mul::op(sub::op(coeff2, mul::op(tanh_out, tanh_out)), sum::op(sqrt_2_over_pi, sub::op(term1, term3)));
     }
 }
 

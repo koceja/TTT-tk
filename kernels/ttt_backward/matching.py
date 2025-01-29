@@ -3,6 +3,22 @@ import thunderkittens
 import multiprocessing
 import time
 
+from kernels.ttt_backward.triton_comps.linear_backward import ttt_linear_scan_backward
+
+from kernels.ttt_backward.triton_comps.mlp_backward_split import (
+    ttt_mlp_stage_1,
+    ttt_mlp_stage_2,
+    ttt_mlp_stage_3,
+    ttt_mlp_backward_stage_1,
+    ttt_mlp_backward_stage_2,
+    ttt_mlp_backward_stage_3,
+    ttt_mlp_backward_stage_4,
+    ttt_mlp_backward_stage_5,
+    ttt_mlp_backward_stage_6,
+    ttt_mlp_backward_stage_7,
+    ttt_mlp_backward_stage_8,
+)
+
 from tabulate import tabulate
 
 def compare_all_grads(gradients_to_compare):
@@ -170,6 +186,7 @@ def compute_mini_batch_no_dual(
         # LN
         std_ln,
         x_hat_ln,
+        Z2
     )
 
 
@@ -358,6 +375,7 @@ def backward(
     )
 
     grad_L_y = ln_weight * grad_L_grad_x_hat_fused
+    # breakpoint()
 
     grad_L_ln_weight_fused = (
         (grad_output_fused * grad_L_grad_x_hat_fused + grad_L_y * x_hat_fused).sum(dim=-2, keepdim=True).sum(dim=0)
@@ -385,21 +403,13 @@ def backward(
 
     grad_L_reconstruction_target = -ln_weight * grad_L_grad_x_hat_fused
 
-    grad_L_ttt_norm_weight = grad_L_ln_weight_ln.reshape(ttt_norm_weight.shape) + grad_L_ln_weight_fused.reshape(
-        ttt_norm_weight.shape
-    )
-    grad_L_ttt_norm_bias = grad_L_ln_bias_ln.reshape(ttt_norm_bias.shape) + grad_L_ln_bias_fused.reshape(
-        ttt_norm_bias.shape
-    )
+    grad_L_ttt_norm_weight = grad_L_ln_weight_ln.reshape(ttt_norm_weight.shape) + grad_L_ln_weight_fused.reshape( ttt_norm_weight.shape )
+    grad_L_ttt_norm_bias = grad_L_ln_bias_ln.reshape(ttt_norm_bias.shape) + grad_L_ln_bias_fused.reshape( ttt_norm_bias.shape  )
 
     # Stage 1: MatMul
-    # grad_L_X2 = (
-    #     grad_L_Z2 @ W2_init.transpose(-2, -1)
-    #     - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
-    # )
     grad_L_X2 = (
         grad_L_Z2 @ W2_init.transpose(-2, -1)
-        # - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
+        - (grad_l_wrt_Z2 @ grad_L_W2_last.transpose(-2, -1)) * last_eta_mini_batch
     )
         
     grad_L_Z1 = grad_L_X2 * gelu_bwd(Z1) + (
@@ -407,13 +417,13 @@ def backward(
         ) * grad_L_grad_l_wrt_Z1 * gelu_bwd_derivative(Z1)
 
     grad_L_XQ = grad_L_XQW_mini_batch + grad_L_XQ_mini_batch
-    grad_L_XK = -grad_L_reconstruction_target + grad_L_XK_mini_batch #+ grad_L_Z1 @ W1_init.transpose(-2, -1)
+    grad_L_XK = -grad_L_reconstruction_target + grad_L_XK_mini_batch + grad_L_Z1 @ W1_init.transpose(-2, -1)
     grad_L_XV = grad_L_reconstruction_target
     
-    grad_L_W2_states = grad_L_W2_last# + grad_L_W2_init + X2.transpose(-2, -1) @ grad_L_Z2
-    grad_L_b2_states = grad_L_b2_last# + grad_L_Z2.sum(-2, keepdim=True)
-    grad_L_W1_states = grad_L_W1_last# + XK_mini_batch.transpose(-2, -1) @ grad_L_Z1
-    grad_L_b1_states = grad_L_b1_last# + grad_L_Z1.sum(-2, keepdim=True)
+    grad_L_W2_states = grad_L_W2_last + grad_L_W2_init + X2.transpose(-2, -1) @ grad_L_Z2
+    grad_L_b2_states = grad_L_b2_last + grad_L_Z2.sum(-2, keepdim=True)
+    grad_L_W1_states = grad_L_W1_last + XK_mini_batch.transpose(-2, -1) @ grad_L_Z1
+    grad_L_b1_states = grad_L_b1_last + grad_L_Z1.sum(-2, keepdim=True)
 
     grad_L_eta = grad_L_eta_mini_batch
     
@@ -428,7 +438,7 @@ def backward(
         grad_L_XV,
         grad_L_XK,
         grad_L_eta,
-        grad_L_Z2
+        (grad_L_Z1_bar)[:,:,:,:64]
     )
 
 
@@ -594,15 +604,1289 @@ def match_backward_pytorch():
     )
 
 
+
+
+
+def run_triton():
+    # match_backward_pytorch()
+    torch.manual_seed(0)
+    # Define shapes
+    B = 1
+    NH = 48
+    K = 16
+
+    reset_states = None
+    
+    seq_len = 32768
+    mini_batch_size = 16
+    CS = mini_batch_size
+    NC = seq_len // mini_batch_size
+    checkpoint_group_size = NC // K
+
+    head_dim = 64
+    F = head_dim
+    expansion_dim = 256
+    shard_size = 4
+
+    dtype = torch.bfloat16
+    full_dtype = torch.float32
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # device = XQ_batch.device
+    mp_dtype = torch.bfloat16  # NOTE: FP32 / BF16 depending on mixed precision policy
+    intermediate_dtype = torch.float32
+
+
+    def get_inputs(dtype):
+        torch.manual_seed(0)
+        # Create inputs
+        xq = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xv = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+
+        eta = torch.ones(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous()
+        last_eta = eta[:, :, :, -1, :, None].contiguous()
+
+        ttt_norm_weight = torch.ones(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+        ttt_norm_bias = torch.ones(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+
+        W1 = torch.ones(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+        b1 = torch.ones(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+        W2 = torch.ones(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+        b2 = torch.ones(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+
+        return xq, xk, xv, eta, last_eta, ttt_norm_weight, ttt_norm_bias, W1, b1, W2, b2
+
+    
+    XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
+
+    XQ_batch = XQ_batch.to(torch.bfloat16).contiguous()
+    XK_batch = XK_batch.to(torch.bfloat16).contiguous()
+    XV_batch = XV_batch.to(torch.bfloat16).contiguous()
+    last_eta = last_eta.to(torch.bfloat16).contiguous()
+
+    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+
+    grad_L_W1_last = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_b1_last = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_W2_last = torch.randn(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_b2_last = torch.randn(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_XQW_batch = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+
+    W1_checkpoints = W1_checkpoints.permute(2, 0, 1, 3, 4).contiguous()
+    b1_checkpoints = b1_checkpoints.permute(2, 0, 1, 3, 4).contiguous()
+    W2_checkpoints = W2_checkpoints.permute(2, 0, 1, 3, 4).contiguous()
+    b2_checkpoints = b2_checkpoints.permute(2, 0, 1, 3, 4).contiguous()
+
+    # State reset
+    W1_0 = W1_checkpoints[0][0].clone().contiguous()
+    b1_0 = b1_checkpoints[0][0].clone().contiguous()
+    W2_0 = W2_checkpoints[0][0].clone().contiguous()
+    b2_0 = b2_checkpoints[0][0].clone().contiguous()
+
+    # Cast upstream grads
+    grad_L_W1_last = grad_L_W1_last.to(torch.float32).contiguous()
+    grad_L_b1_last = grad_L_b1_last.to(torch.float32).contiguous()
+    grad_L_W2_last = grad_L_W2_last.to(torch.float32).contiguous()
+    grad_L_b2_last = grad_L_b2_last.to(torch.float32).contiguous()
+    grad_L_XQW_batch = grad_L_XQW_batch.to(torch.float32).contiguous()
+
+    # Intermediate buffers
+    W1_init_group = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
+    b1_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
+    W2_init_group = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
+    b2_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
+
+    x_hat_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    std_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=intermediate_dtype)
+    Attn1_group = torch.empty(B, NH, checkpoint_group_size, CS, CS, device=device, dtype=intermediate_dtype)
+    Attn2_group = torch.empty(B, NH, checkpoint_group_size, CS, CS, device=device, dtype=intermediate_dtype)
+
+    X2_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=intermediate_dtype)
+    Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=intermediate_dtype)
+    Z1_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=intermediate_dtype)
+    X2_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=intermediate_dtype)
+
+    grad_l_wrt_Z2_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    grad_l_wrt_Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=intermediate_dtype)
+    x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    grad_x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    grad_output_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    std_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=intermediate_dtype)
+
+    # Intermediate buffers between stages
+    grad_L_grad_l_wrt_Z2 = torch.empty(B, NH, CS, F, device=device, dtype=intermediate_dtype)
+    grad_L_eta_Attn2 = torch.empty(B, NH, CS, CS, device=device, dtype=intermediate_dtype)
+    grad_L_XK_mini_batch = torch.zeros(B, NH, CS, F, device=device, dtype=intermediate_dtype)
+    grad_L_Z1_bar = torch.empty(B, NH, CS, F * 4, device=device, dtype=intermediate_dtype)
+    grad_L_Z1 = torch.empty(B, NH, CS, F * 4, device=device, dtype=intermediate_dtype)
+    grad_L_Z2 = torch.empty(B, NH, CS, F, device=device, dtype=intermediate_dtype)
+    grad_L_Z2_bar = torch.empty(B, NH, CS, F, device=device, dtype=intermediate_dtype)
+    grad_l_wrt_Z1_Last = torch.empty(B, NH, F, CS, device=device, dtype=intermediate_dtype)
+    grad_L_grad_l_wrt_Z1 = torch.empty(B, NH, CS, F * 4, device=device, dtype=intermediate_dtype)
+
+    grad_L_W2_init = torch.empty(B, NH, F * 4, F, device=device, dtype=torch.float32)
+    grad_L_b1_init = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
+
+    # Final gradients
+    grad_L_XQ = torch.empty(B, NH, NC, CS, F, device=device, dtype=torch.float32)
+    grad_L_XV = torch.empty(B, NH, NC, CS, F, device=device, dtype=torch.float32)
+    grad_L_XK = torch.empty(B, NH, NC, CS, F, device=device, dtype=torch.float32)
+    grad_L_eta = torch.zeros(B, NH, NC, CS, CS, device=device, dtype=torch.float32)
+
+    # NOTE: Sum over batch post-kernel to avoid sync barrier
+    grad_L_ttt_norm_weight = torch.zeros(B, NH, 1, F, device=device, dtype=torch.float32)
+    grad_L_ttt_norm_bias = torch.zeros(B, NH, 1, F, device=device, dtype=torch.float32)
+
+    # No need for contiguous besides slight speedup
+    grad_L_W1_final = torch.zeros_like(grad_L_W1_last).contiguous()
+    grad_L_b1_final = torch.zeros_like(grad_L_b1_last).contiguous()
+    grad_L_W2_final = torch.zeros_like(grad_L_W2_last).contiguous()
+    grad_L_b2_final = torch.zeros_like(grad_L_b2_last).contiguous()
+
+    CS_F_stride = CS * F
+    CS_CS_stride = CS * CS
+    F_stride = F
+    F4_stride = F * 4
+    F_F4_stride = F * F * 4
+
+    grid = (B, NH)
+
+    print("Start Triton")
+
+    torch.cuda.empty_cache()
+
+    for _ in range(10):
+        for checkpoint_idx in range(K - 1, -1, -1):
+            W1_init = W1_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+            b1_init = b1_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+            W2_init = W2_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+            b2_init = b2_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+
+            # Recover forward activations for current checkpoint group
+            for mini_batch_idx_in_group in range(checkpoint_group_size):
+                mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_idx_in_group
+
+                ttt_mlp_stage_1[grid](
+                    # Scan inputs
+                    ttt_norm_weight,
+                    ttt_norm_bias,
+                    W1_init,
+                    b1_init,
+                    W2_init,
+                    b2_init,
+                    XV_batch,
+                    XK_batch,
+                    # Intermediate buffers
+                    W1_init_group,
+                    b1_init_group,
+                    W2_init_group,
+                    b2_init_group,
+                    X2_group,
+                    Z1_group,
+                    grad_l_wrt_Z2_group,
+                    grad_l_wrt_Z1_group,
+                    x_hat_fused_group,
+                    grad_x_hat_fused_group,
+                    grad_output_fused_group,
+                    std_fused_group,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F_stride,
+                    F4_stride,
+                    # Constant expressions
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    # Index
+                    mini_batch_idx,
+                    mini_batch_idx_in_group,
+                    num_warps=8,
+                    num_stages=4,
+                    num_ctas=1,
+                )
+
+                ttt_mlp_stage_2[grid](
+                    # Scan inputs
+                    W1_init,
+                    b1_init,
+                    XQ_batch,
+                    XK_batch,
+                    eta_batch,
+                    # Intermediate buffers
+                    Attn1_group,
+                    Z1_bar_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z1_group,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F4_stride,
+                    # Constant expressions
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    # Index
+                    mini_batch_idx,
+                    mini_batch_idx_in_group,
+                    num_warps=8,
+                    num_stages=4,
+                    num_ctas=1,
+                )
+
+                ttt_mlp_stage_3[grid](
+                    # Scan inputs
+                    W2_init,
+                    b2_init,
+                    eta_batch,
+                    # Intermediate buffers
+                    x_hat_ln_group,
+                    std_ln_group,
+                    Attn2_group,
+                    X2_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z2_group,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F_stride,
+                    # Constant expressions
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    # Index
+                    mini_batch_idx,
+                    mini_batch_idx_in_group,
+                    num_warps=8,
+                    num_stages=4,
+                    num_ctas=1,
+                )
+
+                if reset_states is not None:
+                    ttt_mlp_reset_states[grid](
+                        W1_init,
+                        b1_init,
+                        W2_init,
+                        b2_init,
+                        W1_0,
+                        b1_0,
+                        W2_0,
+                        b2_0,
+                        reset_states,
+                        F_F4_stride,
+                        F_stride,
+                        F4_stride,
+                        NH,
+                        NC,
+                        CS,
+                        F,
+                        mini_batch_idx,
+                        num_warps=8,
+                    )
+
+            # Run backward pass for current checkpoint group
+            for mini_batch_in_group_idx in range(checkpoint_group_size - 1, -1, -1):
+                mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_idx_in_group
+
+                if reset_states is not None:
+                    ttt_mlp_grad_accum_and_reset[grid](
+                        grad_L_W1_final,
+                        grad_L_b1_final,
+                        grad_L_W2_final,
+                        grad_L_b2_final,
+                        grad_L_W1_last,
+                        grad_L_b1_last,
+                        grad_L_W2_last,
+                        grad_L_b2_last,
+                        reset_states,
+                        F_F4_stride,
+                        F_stride,
+                        F4_stride,
+                        NH,
+                        NC,
+                        CS,
+                        F,
+                        mini_batch_idx,
+                    )
+
+                ttt_mlp_backward_stage_1[grid](
+                    ttt_norm_weight,
+                    # Upstream gradients
+                    grad_L_XQW_batch,
+                    grad_L_W1_last,
+                    # Intermediate buffers
+                    x_hat_ln_group,
+                    std_ln_group,
+                    grad_l_wrt_Z1_group,
+                    # Other stages
+                    grad_L_Z2_bar,
+                    grad_l_wrt_Z1_Last,
+                    # Output buffers
+                    grad_L_ttt_norm_weight,
+                    grad_L_ttt_norm_bias,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_2[grid](
+                    XK_batch,
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W1_last,
+                    grad_L_b1_last,
+                    # Intermediate buffers
+                    W2_init_group,
+                    Attn1_group,
+                    Attn2_group,
+                    X2_group,
+                    Z1_bar_group,
+                    grad_l_wrt_Z2_group,
+                    # Other stages
+                    grad_L_grad_l_wrt_Z1,
+                    grad_L_eta_Attn2,
+                    grad_L_Z1_bar,
+                    grad_L_Z2_bar,
+                    # Output buffers
+                    grad_L_eta,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_3[grid](
+                    XQ_batch,
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W1_last,
+                    grad_L_b1_last,
+                    # Intermediate buffers
+                    grad_l_wrt_Z1_group,
+                    # Other stages
+                    grad_L_XK_mini_batch,
+                    grad_L_Z1_bar,
+                    grad_l_wrt_Z1_Last,
+                    grad_L_b1_init,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_4[grid](
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W2_last,
+                    grad_L_b2_last,
+                    # Intermediate buffers
+                    W2_init_group,
+                    Attn2_group,
+                    X2_group,
+                    Z1_group,
+                    grad_l_wrt_Z2_group,
+                    # Other stages
+                    grad_L_grad_l_wrt_Z2,
+                    grad_L_Z1,
+                    grad_L_Z2_bar,
+                    grad_L_grad_l_wrt_Z1,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_5[grid](
+                    XK_batch,
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_b1_last,
+                    grad_L_W2_last,
+                    grad_L_b2_last,
+                    grad_L_XQW_batch,
+                    # Intermediate buffers
+                    W1_init_group,
+                    Attn1_group,
+                    X2_group,
+                    Z1_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z2_group,
+                    grad_l_wrt_Z1_group,
+                    # Other stages
+                    grad_L_Z1_bar,
+                    grad_L_Z2_bar,
+                    grad_l_wrt_Z1_Last,
+                    grad_L_grad_l_wrt_Z1,
+                    grad_L_W2_init,
+                    # Output buffers
+                    grad_L_XQ,
+                    grad_L_eta,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_6[grid](
+                    ttt_norm_weight,
+                    # Upstream gradients
+                    grad_L_b2_last,
+                    # Intermediate buffers
+                    X2_group,
+                    grad_l_wrt_Z2_group,
+                    x_hat_fused_group,
+                    grad_x_hat_fused_group,
+                    grad_output_fused_group,
+                    std_fused_group,
+                    # Other stages
+                    grad_L_grad_l_wrt_Z2,
+                    grad_L_XK_mini_batch,
+                    grad_L_Z2,
+                    grad_L_W2_init,
+                    # Output buffers
+                    grad_L_ttt_norm_weight,
+                    grad_L_ttt_norm_bias,
+                    grad_L_XV,
+                    grad_L_XK,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_7[grid](
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W2_last,
+                    # Intermediate buffers
+                    W2_init_group,
+                    Z1_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z2_group,
+                    # Other stages
+                    grad_L_eta_Attn2,
+                    grad_L_Z1,
+                    grad_L_Z2,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_8[grid](
+                    XK_batch,
+                    # Upstream gradients
+                    grad_L_W1_last,
+                    grad_L_b1_last,
+                    # Intermediate buffers
+                    W1_init_group,
+                    # Other stages
+                    grad_L_Z1,
+                    grad_L_b1_init,
+                    # Output buffers
+                    grad_L_XK,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                # @Daniel: Hack around extra buffer requirement
+                temp = grad_L_W2_last
+                grad_L_W2_last = grad_L_W2_init
+                grad_L_W2_init = temp
+
+        grad_L_ttt_norm_weight_test = grad_L_ttt_norm_weight.sum(dim=0).squeeze(1)
+        grad_L_ttt_norm_bias_test = grad_L_ttt_norm_bias.sum(dim=0).squeeze(1)
+
+
+    
+    start = time.perf_counter()
+
+    for _ in range(50):
+        for checkpoint_idx in range(K - 1, -1, -1):
+            W1_init = W1_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+            b1_init = b1_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+            W2_init = W2_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+            b2_init = b2_checkpoints[checkpoint_idx, :, :, :, :].contiguous()
+
+            # Recover forward activations for current checkpoint group
+            for mini_batch_idx_in_group in range(checkpoint_group_size):
+                mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_idx_in_group
+
+                ttt_mlp_stage_1[grid](
+                    # Scan inputs
+                    ttt_norm_weight,
+                    ttt_norm_bias,
+                    W1_init,
+                    b1_init,
+                    W2_init,
+                    b2_init,
+                    XV_batch,
+                    XK_batch,
+                    # Intermediate buffers
+                    W1_init_group,
+                    b1_init_group,
+                    W2_init_group,
+                    b2_init_group,
+                    X2_group,
+                    Z1_group,
+                    grad_l_wrt_Z2_group,
+                    grad_l_wrt_Z1_group,
+                    x_hat_fused_group,
+                    grad_x_hat_fused_group,
+                    grad_output_fused_group,
+                    std_fused_group,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F_stride,
+                    F4_stride,
+                    # Constant expressions
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    # Index
+                    mini_batch_idx,
+                    mini_batch_idx_in_group,
+                    num_warps=8,
+                    num_stages=4,
+                    num_ctas=1,
+                )
+
+                ttt_mlp_stage_2[grid](
+                    # Scan inputs
+                    W1_init,
+                    b1_init,
+                    XQ_batch,
+                    XK_batch,
+                    eta_batch,
+                    # Intermediate buffers
+                    Attn1_group,
+                    Z1_bar_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z1_group,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F4_stride,
+                    # Constant expressions
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    # Index
+                    mini_batch_idx,
+                    mini_batch_idx_in_group,
+                    num_warps=8,
+                    num_stages=4,
+                    num_ctas=1,
+                )
+
+                ttt_mlp_stage_3[grid](
+                    # Scan inputs
+                    W2_init,
+                    b2_init,
+                    eta_batch,
+                    # Intermediate buffers
+                    x_hat_ln_group,
+                    std_ln_group,
+                    Attn2_group,
+                    X2_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z2_group,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F_stride,
+                    # Constant expressions
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    # Index
+                    mini_batch_idx,
+                    mini_batch_idx_in_group,
+                    num_warps=8,
+                    num_stages=4,
+                    num_ctas=1,
+                )
+
+                if reset_states is not None:
+                    ttt_mlp_reset_states[grid](
+                        W1_init,
+                        b1_init,
+                        W2_init,
+                        b2_init,
+                        W1_0,
+                        b1_0,
+                        W2_0,
+                        b2_0,
+                        reset_states,
+                        F_F4_stride,
+                        F_stride,
+                        F4_stride,
+                        NH,
+                        NC,
+                        CS,
+                        F,
+                        mini_batch_idx,
+                        num_warps=8,
+                    )
+
+            # Run backward pass for current checkpoint group
+            for mini_batch_in_group_idx in range(checkpoint_group_size - 1, -1, -1):
+                mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_idx_in_group
+
+                if reset_states is not None:
+                    ttt_mlp_grad_accum_and_reset[grid](
+                        grad_L_W1_final,
+                        grad_L_b1_final,
+                        grad_L_W2_final,
+                        grad_L_b2_final,
+                        grad_L_W1_last,
+                        grad_L_b1_last,
+                        grad_L_W2_last,
+                        grad_L_b2_last,
+                        reset_states,
+                        F_F4_stride,
+                        F_stride,
+                        F4_stride,
+                        NH,
+                        NC,
+                        CS,
+                        F,
+                        mini_batch_idx,
+                    )
+
+                ttt_mlp_backward_stage_1[grid](
+                    ttt_norm_weight,
+                    # Upstream gradients
+                    grad_L_XQW_batch,
+                    grad_L_W1_last,
+                    # Intermediate buffers
+                    x_hat_ln_group,
+                    std_ln_group,
+                    grad_l_wrt_Z1_group,
+                    # Other stages
+                    grad_L_Z2_bar,
+                    grad_l_wrt_Z1_Last,
+                    # Output buffers
+                    grad_L_ttt_norm_weight,
+                    grad_L_ttt_norm_bias,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_2[grid](
+                    XK_batch,
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W1_last,
+                    grad_L_b1_last,
+                    # Intermediate buffers
+                    W2_init_group,
+                    Attn1_group,
+                    Attn2_group,
+                    X2_group,
+                    Z1_bar_group,
+                    grad_l_wrt_Z2_group,
+                    # Other stages
+                    grad_L_grad_l_wrt_Z1,
+                    grad_L_eta_Attn2,
+                    grad_L_Z1_bar,
+                    grad_L_Z2_bar,
+                    # Output buffers
+                    grad_L_eta,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_3[grid](
+                    XQ_batch,
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W1_last,
+                    grad_L_b1_last,
+                    # Intermediate buffers
+                    grad_l_wrt_Z1_group,
+                    # Other stages
+                    grad_L_XK_mini_batch,
+                    grad_L_Z1_bar,
+                    grad_l_wrt_Z1_Last,
+                    grad_L_b1_init,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_4[grid](
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W2_last,
+                    grad_L_b2_last,
+                    # Intermediate buffers
+                    W2_init_group,
+                    Attn2_group,
+                    X2_group,
+                    Z1_group,
+                    grad_l_wrt_Z2_group,
+                    # Other stages
+                    grad_L_grad_l_wrt_Z2,
+                    grad_L_Z1,
+                    grad_L_Z2_bar,
+                    grad_L_grad_l_wrt_Z1,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_5[grid](
+                    XK_batch,
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_b1_last,
+                    grad_L_W2_last,
+                    grad_L_b2_last,
+                    grad_L_XQW_batch,
+                    # Intermediate buffers
+                    W1_init_group,
+                    Attn1_group,
+                    X2_group,
+                    Z1_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z2_group,
+                    grad_l_wrt_Z1_group,
+                    # Other stages
+                    grad_L_Z1_bar,
+                    grad_L_Z2_bar,
+                    grad_l_wrt_Z1_Last,
+                    grad_L_grad_l_wrt_Z1,
+                    grad_L_W2_init,
+                    # Output buffers
+                    grad_L_XQ,
+                    grad_L_eta,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    F_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_6[grid](
+                    ttt_norm_weight,
+                    # Upstream gradients
+                    grad_L_b2_last,
+                    # Intermediate buffers
+                    X2_group,
+                    grad_l_wrt_Z2_group,
+                    x_hat_fused_group,
+                    grad_x_hat_fused_group,
+                    grad_output_fused_group,
+                    std_fused_group,
+                    # Other stages
+                    grad_L_grad_l_wrt_Z2,
+                    grad_L_XK_mini_batch,
+                    grad_L_Z2,
+                    grad_L_W2_init,
+                    # Output buffers
+                    grad_L_ttt_norm_weight,
+                    grad_L_ttt_norm_bias,
+                    grad_L_XV,
+                    grad_L_XK,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_7[grid](
+                    eta_batch,
+                    # Upstream gradients
+                    grad_L_W2_last,
+                    # Intermediate buffers
+                    W2_init_group,
+                    Z1_group,
+                    X2_bar_group,
+                    grad_l_wrt_Z2_group,
+                    # Other stages
+                    grad_L_eta_Attn2,
+                    grad_L_Z1,
+                    grad_L_Z2,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    CS_CS_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                ttt_mlp_backward_stage_8[grid](
+                    XK_batch,
+                    # Upstream gradients
+                    grad_L_W1_last,
+                    grad_L_b1_last,
+                    # Intermediate buffers
+                    W1_init_group,
+                    # Other stages
+                    grad_L_Z1,
+                    grad_L_b1_init,
+                    # Output buffers
+                    grad_L_XK,
+                    # Strides
+                    CS_F_stride,
+                    F_F4_stride,
+                    F4_stride,
+                    # Constants
+                    NH,
+                    NC,
+                    CS,
+                    F,
+                    checkpoint_group_size,
+                    checkpoint_idx,
+                    mini_batch_in_group_idx,
+                    num_warps=8,
+                )
+
+                # @Daniel: Hack around extra buffer requirement
+                temp = grad_L_W2_last
+                grad_L_W2_last = grad_L_W2_init
+                grad_L_W2_init = temp
+
+        grad_L_ttt_norm_weight_test = grad_L_ttt_norm_weight.sum(dim=0).squeeze(1)
+        grad_L_ttt_norm_bias_test = grad_L_ttt_norm_bias.sum(dim=0).squeeze(1)
+
+
+    end = time.perf_counter()
+    
+    return (end - start) / 50
+
+
+
+def run_triton_m1():
+    # match_backward_pytorch()
+    torch.manual_seed(0)
+    # Define shapes
+    B = 1
+    NH = 48
+    K = 16
+
+    reset_states = None
+    
+    seq_len = 32768
+    mini_batch_size = 16
+    CS = mini_batch_size
+    NC = seq_len // mini_batch_size
+    checkpoint_group_size = NC // K
+
+    head_dim = 64
+    F = head_dim
+    expansion_dim = 256
+    shard_size = 4
+
+    dtype = torch.bfloat16
+    full_dtype = torch.float32
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # device = XQ_batch.device
+    mp_dtype = torch.bfloat16  # NOTE: FP32 / BF16 depending on mixed precision policy
+    intermediate_dtype = torch.float32
+
+
+    def get_inputs(dtype):
+        torch.manual_seed(0)
+        # Create inputs
+        xq = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xv = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+
+        eta = torch.ones(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous()
+        last_eta = eta[:, :, :, -1, :, None].contiguous()
+
+        ttt_norm_weight = torch.ones(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+        ttt_norm_bias = torch.ones(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+
+        W1 = torch.ones(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+        b1 = torch.ones(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+        W2 = torch.ones(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+        b2 = torch.ones(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+
+        return xq, xk, xv, eta, last_eta, ttt_norm_weight, ttt_norm_bias, W1, b1, W2, b2
+
+    
+    XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
+
+    XQ_batch = XQ_batch.to(torch.bfloat16).contiguous()
+    XK_batch = XK_batch.to(torch.bfloat16).contiguous()
+    XV_batch = XV_batch.to(torch.bfloat16).contiguous()
+    last_eta = last_eta.to(torch.bfloat16).contiguous()
+
+    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+    output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+
+    grad_L_W1_last = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_b1_last = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_W2_last = torch.randn(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_b2_last = torch.randn(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
+    grad_L_XQW_batch = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+
+
+
+
+
+
+    # B, NH, NC, CS, F = XQ_batch.shape
+    K = W1_checkpoints.shape[2]
+    checkpoint_group_size = NC // K
+
+    device = 'cuda'
+    mp_dtype = XQ_batch.dtype  # NOTE: FP32 / BF16 depending on mixed precision policy
+    intermediate_dtype = torch.float32
+
+    # Intermediate buffers for each checkpoint group
+    W1_init_group = torch.empty(B, NH, checkpoint_group_size, F, F, device=device, dtype=torch.float32)
+    b1_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
+
+    x_hat_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    std_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=intermediate_dtype)
+    grad_l_wrt_Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    Attn1_group = torch.empty(B, NH, checkpoint_group_size, CS, CS, device=device, dtype=intermediate_dtype)
+    x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    grad_x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    grad_output_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+    std_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=intermediate_dtype)
+    XQW_mini_batch_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=intermediate_dtype)
+
+    # NOTE: Sum over batch post-kernel to avoid sync barrier
+    grad_L_ttt_norm_weight = torch.empty(B, NH, 1, F, device=device, dtype=torch.float32)
+    grad_L_ttt_norm_bias = torch.empty(B, NH, 1, F, device=device, dtype=torch.float32)
+
+    grad_L_W1_init = torch.empty(B, NH, F, F, device=device, dtype=torch.float32)
+    grad_L_b1_init = torch.empty(B, NH, 1, F, device=device, dtype=torch.float32)
+
+    grad_L_XQ = torch.empty(B, NH, NC, CS, F, device=device, dtype=torch.float32)
+    grad_L_XV = torch.empty(B, NH, NC, CS, F, device=device, dtype=torch.float32)
+    grad_L_XK = torch.empty(B, NH, NC, CS, F, device=device, dtype=torch.float32)
+    grad_L_eta = torch.empty(B, NH, NC, CS, CS, device=device, dtype=torch.float32)
+
+    CS_F_stride = CS * F
+    F_F_stride = F * F
+    CS_CS_stride = CS * CS
+    F_stride = F
+
+    enable_reset_states = reset_states is not None
+
+    grid = (B, NH)
+
+    torch.cuda.empty_cache()
+
+    for _ in range(10):
+        ttt_linear_scan_backward[grid](
+            XQ_batch.contiguous(),
+            XV_batch.contiguous(),
+            XK_batch.contiguous(),
+            eta_batch.contiguous(),
+            ttt_norm_weight.contiguous(),
+            ttt_norm_bias.contiguous(),
+            reset_states.contiguous() if enable_reset_states else None,
+            W1_checkpoints.contiguous(),
+            b1_checkpoints.contiguous(),
+            # Upstream gradients
+            grad_L_W1_last.to(torch.float32).contiguous(),
+            grad_L_b1_last.to(torch.float32).contiguous(),
+            grad_L_XQW_batch.contiguous(),
+            # Intermediate buffers,
+            XQW_mini_batch_group.contiguous(),
+            W1_init_group.contiguous(),
+            b1_init_group.contiguous(),
+            x_hat_ln_group.contiguous(),
+            std_ln_group.contiguous(),
+            grad_l_wrt_Z1_group.contiguous(),
+            Attn1_group.contiguous(),
+            x_hat_fused_group.contiguous(),
+            grad_x_hat_fused_group.contiguous(),
+            grad_output_fused_group.contiguous(),
+            std_fused_group.contiguous(),
+            # Output buffers
+            grad_L_ttt_norm_weight.contiguous(),
+            grad_L_ttt_norm_bias.contiguous(),
+            grad_L_W1_init.contiguous(),
+            grad_L_b1_init.contiguous(),
+            grad_L_XQ.contiguous(),
+            grad_L_XV.contiguous(),
+            grad_L_XK.contiguous(),
+            grad_L_eta.contiguous(),
+            # Strides
+            CS_F_stride,
+            F_F_stride,
+            CS_CS_stride,
+            F_stride,
+            # Constant expressions
+            NH,
+            NC,
+            CS,
+            F,
+            K,
+            checkpoint_group_size,
+            enable_reset_states,
+        )
+        torch.cuda.synchronize()
+
+        grad_L_ttt_norm_weight_test = grad_L_ttt_norm_weight.sum(dim=0).squeeze(1)
+        grad_L_ttt_norm_bias_test = grad_L_ttt_norm_bias.sum(dim=0).squeeze(1)
+
+    print("Starting m1 backward")
+
+    start = time.perf_counter()
+
+    for _ in range(50):
+
+        ttt_linear_scan_backward[grid](
+            XQ_batch.contiguous(),
+            XV_batch.contiguous(),
+            XK_batch.contiguous(),
+            eta_batch.contiguous(),
+            ttt_norm_weight.contiguous(),
+            ttt_norm_bias.contiguous(),
+            reset_states.contiguous() if enable_reset_states else None,
+            W1_checkpoints.contiguous(),
+            b1_checkpoints.contiguous(),
+            # Upstream gradients
+            grad_L_W1_last.to(torch.float32).contiguous(),
+            grad_L_b1_last.to(torch.float32).contiguous(),
+            grad_L_XQW_batch.contiguous(),
+            # Intermediate buffers,
+            XQW_mini_batch_group.contiguous(),
+            W1_init_group.contiguous(),
+            b1_init_group.contiguous(),
+            x_hat_ln_group.contiguous(),
+            std_ln_group.contiguous(),
+            grad_l_wrt_Z1_group.contiguous(),
+            Attn1_group.contiguous(),
+            x_hat_fused_group.contiguous(),
+            grad_x_hat_fused_group.contiguous(),
+            grad_output_fused_group.contiguous(),
+            std_fused_group.contiguous(),
+            # Output buffers
+            grad_L_ttt_norm_weight.contiguous(),
+            grad_L_ttt_norm_bias.contiguous(),
+            grad_L_W1_init.contiguous(),
+            grad_L_b1_init.contiguous(),
+            grad_L_XQ.contiguous(),
+            grad_L_XV.contiguous(),
+            grad_L_XK.contiguous(),
+            grad_L_eta.contiguous(),
+            # Strides
+            CS_F_stride,
+            F_F_stride,
+            CS_CS_stride,
+            F_stride,
+            # Constant expressions
+            NH,
+            NC,
+            CS,
+            F,
+            K,
+            checkpoint_group_size,
+            enable_reset_states,
+        )
+        torch.cuda.synchronize()
+
+        grad_L_ttt_norm_weight_test = grad_L_ttt_norm_weight.sum(dim=0).squeeze(1)
+        grad_L_ttt_norm_bias_test = grad_L_ttt_norm_bias.sum(dim=0).squeeze(1)
+
+    end = time.perf_counter()
+
+    return (end - start) / 50
+
+
+
+
+
 def main():
     # match_backward_pytorch()
     torch.manual_seed(0)
     # Define shapes
     B = 1
-    NH = 1
-    K = 1
+    NH = 48
+    K = 8
     
-    seq_len = 64
+    seq_len = 32768
     mini_batch_size = 64
     CS = mini_batch_size
     NC = seq_len // mini_batch_size
@@ -628,8 +1912,8 @@ def main():
         eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous() * 0.1
         last_eta = eta[:, :, :, -1, :, None].contiguous()
 
-        ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous()
-        ttt_norm_bias = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous()
+        ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+        ttt_norm_bias = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
 
         W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
         b1 = torch.randn(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
@@ -646,10 +1930,10 @@ def main():
     XV_batch = XV_batch.to(torch.bfloat16).contiguous()
     last_eta = last_eta.to(torch.bfloat16).contiguous()
 
-    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous()
-    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous()
-    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous()
-    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
     output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
     output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
@@ -657,39 +1941,40 @@ def main():
     grad_L_b1_last = torch.zeros(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
     grad_L_W2_last = torch.zeros(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
     grad_L_b2_last = torch.zeros(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-    grad_L_XQW_mini_batch = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    # grad_L_XQW_mini_batch = torch.arange(B* NH* NC* mini_batch_size* head_dim).to(torch.bfloat16).to(device).view(B, NH, NC, mini_batch_size, head_dim).contiguous() * 0.02
+    grad_L_XQW_mini_batch = (torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device)* 0.02).contiguous()
 
-    grad_L_ttt_norm_weight = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
-    grad_L_ttt_norm_bias = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
-    grad_L_W1_init = torch.empty(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_b1_init = torch.empty(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_W2_init = torch.empty(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_b2_init = torch.empty(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous()
-    grad_L_XQ = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
+    grad_L_ttt_norm_weight = torch.zeros(B, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    grad_L_ttt_norm_bias = torch.zeros(B, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    grad_L_W1_init = torch.zeros(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous()
+    grad_L_b1_init = torch.zeros(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous()
+    grad_L_W2_init = torch.zeros(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous()
+    grad_L_b2_init = torch.zeros(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous()
+    grad_L_XQ = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
     grad_L_XK = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
     grad_L_XV = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
     grad_L_last_eta = torch.zeros_like(last_eta).contiguous()
 
     # TK rematted values
-    W1_init_group = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
-    b1_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
-    W2_init_group = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
-    b2_init_group = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
+    W1_init_group = torch.zeros(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32).contiguous()
+    b1_init_group = torch.zeros(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32).contiguous()
+    W2_init_group = torch.zeros(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32).contiguous()
+    b2_init_group = torch.zeros(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32).contiguous()
 
-    x_hat_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    std_ln_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+    x_hat_ln_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    std_ln_group = torch.zeros(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32).contiguous()
 
-    X2_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    Z1_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    X2_bar_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
+    X2_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    Z1_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    Z1_bar_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    X2_bar_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
 
-    grad_l_wrt_Z2_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    grad_l_wrt_Z1_group = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype)
-    x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    grad_x_hat_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    grad_output_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype)
-    std_fused_group = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+    grad_l_wrt_Z2_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    grad_l_wrt_Z1_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    x_hat_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    grad_x_hat_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    grad_output_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    std_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32).contiguous()
 
     # Ref rematted values
     W1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
@@ -712,8 +1997,8 @@ def main():
     grad_output_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
     std_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
 
-    grad_L_ttt_norm_weight_ref = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
-    grad_L_ttt_norm_bias_ref = torch.empty(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    grad_L_ttt_norm_weight_ref = torch.zeros(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
+    grad_L_ttt_norm_bias_ref = torch.zeros(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
     grad_L_W1_init_ref = grad_L_W1_last.clone().contiguous()
     grad_L_b1_init_ref = grad_L_b1_last.clone().contiguous()
     grad_L_W2_init_ref = grad_L_W2_last.clone().contiguous()
@@ -724,62 +2009,203 @@ def main():
     grad_L_eta_ref = torch.empty_like(eta_batch).contiguous()
 
 
+    # print("Start TK")
+    # torch.cuda.empty_cache()
 
+    # for _ in range(10):
+
+    #     thunderkittens.ttt_backward(
+    #         # Inputs
+    #         XQ_batch,
+    #         XK_batch,
+    #         XV_batch,
+    #         last_eta,
+    #         ttt_norm_weight,
+    #         ttt_norm_bias,
+    #         W1_init,
+    #         b1_init,
+    #         W2_init,
+    #         b2_init,
+    #         # Checkpoints
+    #         W1_checkpoints,
+    #         b1_checkpoints,
+    #         W2_checkpoints,
+    #         b2_checkpoints,
+    #         output_tk,
+    #         # Rematted Buffers
+    #         W1_init_group,
+    #         b1_init_group,
+    #         W2_init_group,
+    #         b2_init_group,
+    #         x_hat_ln_group,
+    #         std_ln_group,
+    #         X2_group,
+    #         Z1_group,
+    #         Z1_bar_group,
+    #         X2_bar_group,
+    #         grad_l_wrt_Z2_group,
+    #         grad_l_wrt_Z1_group,
+    #         x_hat_fused_group,
+    #         grad_x_hat_fused_group,
+    #         grad_output_fused_group,
+    #         std_fused_group,
+    #         # Upstream grads
+    #         grad_L_W1_last,
+    #         grad_L_b1_last,
+    #         grad_L_W2_last,
+    #         grad_L_b2_last,
+    #         grad_L_XQW_mini_batch,
+    #         # Output grads
+    #         grad_L_ttt_norm_weight,
+    #         grad_L_ttt_norm_bias,
+    #         grad_L_W1_init,
+    #         grad_L_b1_init,
+    #         grad_L_W2_init,
+    #         grad_L_b2_init,
+    #         grad_L_last_eta,
+    #         grad_L_XQ,
+    #         grad_L_XK,
+    #         grad_L_XV
+    #     )
+
+    #     grad_L_ttt_norm_weight_test = grad_L_ttt_norm_weight.sum(dim=0)
+    #     grad_L_ttt_norm_bias_test = grad_L_ttt_norm_bias.sum(dim=0)
+
+    # start_tk = time.perf_counter()
+
+    # for _ in range(50):
+
+    #     thunderkittens.ttt_backward(
+    #         # Inputs
+    #         XQ_batch,
+    #         XK_batch,
+    #         XV_batch,
+    #         last_eta,
+    #         ttt_norm_weight,
+    #         ttt_norm_bias,
+    #         W1_init,
+    #         b1_init,
+    #         W2_init,
+    #         b2_init,
+    #         # Checkpoints
+    #         W1_checkpoints,
+    #         b1_checkpoints,
+    #         W2_checkpoints,
+    #         b2_checkpoints,
+    #         output_tk,
+    #         # Rematted Buffers
+    #         W1_init_group,
+    #         b1_init_group,
+    #         W2_init_group,
+    #         b2_init_group,
+    #         x_hat_ln_group,
+    #         std_ln_group,
+    #         X2_group,
+    #         Z1_group,
+    #         Z1_bar_group,
+    #         X2_bar_group,
+    #         grad_l_wrt_Z2_group,
+    #         grad_l_wrt_Z1_group,
+    #         x_hat_fused_group,
+    #         grad_x_hat_fused_group,
+    #         grad_output_fused_group,
+    #         std_fused_group,
+    #         # Upstream grads
+    #         grad_L_W1_last,
+    #         grad_L_b1_last,
+    #         grad_L_W2_last,
+    #         grad_L_b2_last,
+    #         grad_L_XQW_mini_batch,
+    #         # Output grads
+    #         grad_L_ttt_norm_weight,
+    #         grad_L_ttt_norm_bias,
+    #         grad_L_W1_init,
+    #         grad_L_b1_init,
+    #         grad_L_W2_init,
+    #         grad_L_b2_init,
+    #         grad_L_last_eta,
+    #         grad_L_XQ,
+    #         grad_L_XK,
+    #         grad_L_XV
+    #     )
+
+    #     grad_L_ttt_norm_weight_test = grad_L_ttt_norm_weight.sum(dim=0)
+    #     grad_L_ttt_norm_bias_test = grad_L_ttt_norm_bias.sum(dim=0)
+
+    # end_tk = time.perf_counter()
+
+    # elapsed_time = (end_tk - start_tk) / 50
+    # print(f"TK time: {elapsed_time:.6f} seconds")
+    # print("Finished tk kernel")
+   
     thunderkittens.ttt_backward(
         # Inputs
-        XQ_batch,
-        XK_batch,
-        XV_batch,
-        last_eta,
-        ttt_norm_weight,
-        ttt_norm_bias,
-        W1_init,
-        b1_init,
-        W2_init,
-        b2_init,
+        XQ_batch.contiguous(),
+        XK_batch.contiguous(),
+        XV_batch.contiguous(),
+        last_eta.contiguous(),
+        ttt_norm_weight.contiguous(),
+        ttt_norm_bias.contiguous(),
+        W1_init.contiguous(),
+        b1_init.contiguous(),
+        W2_init.contiguous(),
+        b2_init.contiguous(),
         # Checkpoints
-        W1_checkpoints,
-        b1_checkpoints,
-        W2_checkpoints,
-        b2_checkpoints,
-        output_tk,
+        W1_checkpoints.contiguous(),
+        b1_checkpoints.contiguous(),
+        W2_checkpoints.contiguous(),
+        b2_checkpoints.contiguous(),
+        output_tk.contiguous(),
         # Rematted Buffers
-        W1_init_group,
-        b1_init_group,
-        W2_init_group,
-        b2_init_group,
-        x_hat_ln_group,
-        std_ln_group,
-        X2_group,
-        Z1_group,
-        Z1_bar_group,
-        X2_bar_group,
-        grad_l_wrt_Z2_group,
-        grad_l_wrt_Z1_group,
-        x_hat_fused_group,
-        grad_x_hat_fused_group,
-        grad_output_fused_group,
-        std_fused_group,
+        W1_init_group.contiguous(),
+        b1_init_group.contiguous(),
+        W2_init_group.contiguous(),
+        b2_init_group.contiguous(),
+        x_hat_ln_group.contiguous(),
+        std_ln_group.contiguous(),
+        X2_group.contiguous(),
+        Z1_group.contiguous(),
+        Z1_bar_group.contiguous(),
+        X2_bar_group.contiguous(),
+        grad_l_wrt_Z2_group.contiguous(),
+        grad_l_wrt_Z1_group.contiguous(),
+        x_hat_fused_group.contiguous(),
+        grad_x_hat_fused_group.contiguous(),
+        grad_output_fused_group.contiguous(),
+        std_fused_group.contiguous(),
         # Upstream grads
-        grad_L_W1_last,
-        grad_L_b1_last,
-        grad_L_W2_last,
-        grad_L_b2_last,
-        grad_L_XQW_mini_batch,
+        grad_L_W1_last.contiguous(),
+        grad_L_b1_last.contiguous(),
+        grad_L_W2_last.contiguous(),
+        grad_L_b2_last.contiguous(),
+        grad_L_XQW_mini_batch.contiguous(),
         # Output grads
-        grad_L_ttt_norm_weight,
-        grad_L_ttt_norm_bias,
-        grad_L_W1_init,
-        grad_L_b1_init,
-        grad_L_W2_init,
-        grad_L_b2_init,
-        grad_L_last_eta,
-        grad_L_XQ,
-        grad_L_XK,
-        grad_L_XV
+        grad_L_ttt_norm_weight.contiguous(),
+        grad_L_ttt_norm_bias.contiguous(),
+        grad_L_W1_init.contiguous(),
+        grad_L_b1_init.contiguous(),
+        grad_L_W2_init.contiguous(),
+        grad_L_b2_init.contiguous(),
+        grad_L_last_eta.contiguous(),
+        grad_L_XQ.contiguous(),
+        grad_L_XK.contiguous(),
+        grad_L_XV.contiguous(),
     )
 
+    grad_L_ttt_norm_weight = grad_L_ttt_norm_weight.sum(dim=0)
+    grad_L_ttt_norm_bias = grad_L_ttt_norm_bias.sum(dim=0)
+
+
     XQ_batch, XK_batch, XV_batch, eta_batch, last_eta, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.float32)
+
+    # triton_time = run_triton()
+
+    # print(f"triton_time: {triton_time} seconds")
+
+
+    # triton_m1_time = run_triton_m1()
+
+    # print(f"triton_m1_time: {triton_m1_time} seconds")
 
     
 
@@ -799,6 +2225,11 @@ def main():
             xk_mb = XK_batch[:,:,global_mini_batch_idx]
             xv_mb = XV_batch[:,:,global_mini_batch_idx]
             eta_mb = eta_batch[:, :, global_mini_batch_idx]
+
+            W1_init_group_ref[:,:,i] = W1_curr
+            b1_init_group_ref[:,:,i] = b1_curr
+            W2_init_group_ref[:,:,i] = W2_curr
+            b2_init_group_ref[:,:,i] = b2_curr
 
             (
                 output_ref[:, :, global_mini_batch_idx],
@@ -820,6 +2251,7 @@ def main():
                 # LN
                 std_ln_group_ref[:,:,i],
                 x_hat_ln_group_ref[:,:,i],
+                _
             ) = compute_mini_batch_no_dual(
                 W1_curr, 
                 b1_curr, 
@@ -833,10 +2265,7 @@ def main():
                 ttt_norm_bias
             )
 
-            W1_init_group_ref[:,:,i] = W1_curr
-            b1_init_group_ref[:,:,i] = b1_curr
-            W2_init_group_ref[:,:,i] = W2_curr
-            b2_init_group_ref[:,:,i] = b2_curr
+            
 
         for i in range(checkpoint_group_size - 1, -1, -1):
             global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + i
@@ -891,7 +2320,7 @@ def main():
                 grad_L_b1_init_ref,
                 grad_L_W2_init_ref,
                 grad_L_b2_init_ref,
-                grad_L_XQW_mini_batch[:, :, i],
+                grad_L_XQW_mini_batch[:, :, global_mini_batch_idx].to(torch.float32),
             )
 
             W1_curr = W1_init_group_ref[:, :, i]
@@ -915,28 +2344,28 @@ def main():
 
     gradients_to_compare = [
         # W1_init_group
-        # (W1_init_group, W1_init_group_ref, "W1_init_group"),
-        # (b1_init_group, b1_init_group_ref, "b1_init_group"),
-        # (W2_init_group, W2_init_group_ref, "W2_init_group"),
-        # (b2_init_group, b2_init_group_ref, "b2_init_group"),
+        (W1_init_group, W1_init_group_ref, "W1_init_group"),
+        (b1_init_group, b1_init_group_ref, "b1_init_group"),
+        (W2_init_group, W2_init_group_ref, "W2_init_group"),
+        (b2_init_group, b2_init_group_ref, "b2_init_group"),
 
-        # # Layer Norm Groups
-        # (x_hat_ln_group, x_hat_ln_group_ref, "x_hat_ln_group"),
-        # (std_ln_group, std_ln_group_ref, "std_ln_group"),
+        # Layer Norm Groups
+        (x_hat_ln_group, x_hat_ln_group_ref, "x_hat_ln_group"),
+        (std_ln_group, std_ln_group_ref, "std_ln_group"),
 
-        # # Intermediate Computations
-        # (X2_group, X2_group_ref, "X2_group"),
-        # (Z1_group, Z1_group_ref, "Z1_group"),
-        # (Z1_bar_group, Z1_bar_group_ref, "Z1_bar_group"),
-        # (X2_bar_group, X2_bar_group_ref, "X2_bar_group"),
+        # Intermediate Computations
+        (X2_group, X2_group_ref, "X2_group"),
+        (Z1_group, Z1_group_ref, "Z1_group"),
+        (Z1_bar_group, Z1_bar_group_ref, "Z1_bar_group"),
+        (X2_bar_group, X2_bar_group_ref, "X2_bar_group"),
 
-        # # Gradients
-        # (grad_l_wrt_Z2_group, grad_l_wrt_Z2_group_ref, "grad_l_wrt_Z2_group"),
-        # (grad_l_wrt_Z1_group, grad_l_wrt_Z1_group_ref, "grad_l_wrt_Z1_group"),
-        # (x_hat_fused_group, x_hat_fused_group_ref, "x_hat_fused_group"),
-        # (grad_x_hat_fused_group, grad_x_hat_fused_group_ref, "grad_x_hat_fused_group"),
-        # (grad_output_fused_group, grad_output_fused_group_ref, "grad_output_fused_group"),
-        # (std_fused_group, std_fused_group_ref, "std_fused_group"),
+        # Gradients
+        (grad_l_wrt_Z2_group, grad_l_wrt_Z2_group_ref, "grad_l_wrt_Z2_group"),
+        (grad_l_wrt_Z1_group, grad_l_wrt_Z1_group_ref, "grad_l_wrt_Z1_group"),
+        (x_hat_fused_group, x_hat_fused_group_ref, "x_hat_fused_group"),
+        (grad_x_hat_fused_group, grad_x_hat_fused_group_ref, "grad_x_hat_fused_group"),
+        (grad_output_fused_group, grad_output_fused_group_ref, "grad_output_fused_group"),
+        (std_fused_group, std_fused_group_ref, "std_fused_group"),
         (grad_L_W1_init, grad_L_W1_init_ref, "grad_L_W1"),
         (grad_L_b1_init, grad_L_b1_init_ref, "grad_L_b1"),
         (grad_L_W2_init, grad_L_W2_init_ref, "grad_L_W2"),
@@ -982,6 +2411,6 @@ if __name__ == '__main__':
         main()
     else:
         try:
-            kernel_with_timeout(main, timeout=15)
+            kernel_with_timeout(main, timeout=240)
         except RuntimeError as e:
             print(e)
