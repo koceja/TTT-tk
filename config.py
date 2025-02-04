@@ -24,8 +24,8 @@ sources = {
 
 ### WHICH KERNELS DO WE WANT TO BUILD?
 # (oftentimes during development work you don't need to redefine them all.)
-# kernels = ['ttt', 'ttt_backward']
-kernels = ['ttt_backward']
+kernels = ['ttt', 'ttt_backward']
+# kernels = ['ttt_backward']
 
 ### WHICH GPU TARGET DO WE WANT TO BUILD FOR?
 target = 'h100'

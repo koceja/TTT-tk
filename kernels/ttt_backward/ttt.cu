@@ -36,6 +36,8 @@ __device__ static inline void tp_reduce(
     if (wg_warpid == 0) tma::cluster::store_async(reduction_buffer, src, tp ^ 1, dsmem_semaphore1);
     kittens::wait(dsmem_semaphore1, idx % 2);
 
+    tma::cluster::sync();
+
     warpgroup::add(src, src, reduction_buffer);
     warpgroup::sync(1);
 
@@ -43,6 +45,8 @@ __device__ static inline void tp_reduce(
     tma::cluster::sync();
     if (wg_warpid == 0) tma::cluster::store_async(reduction_buffer, src, tp ^ 3, dsmem_semaphore2);
     kittens::wait(dsmem_semaphore2, idx % 2);
+
+    tma::cluster::sync();
 
     warpgroup::add(src, src, reduction_buffer);
     warpgroup::sync(1);
@@ -52,6 +56,8 @@ __device__ static inline void tp_reduce_arrive()
 {
     static_assert(TP == 4, "Reduction is only implemented for tp=4.");
     // need two here since we need two global reads to reduce 4
+    tma::cluster::arrive_aligned();
+    tma::cluster::arrive_aligned();
     tma::cluster::arrive_aligned();
     tma::cluster::arrive_aligned();
 }
@@ -110,11 +116,6 @@ template <int head_dim> struct bwd_globals {
     ttt_norm_weight_gl ttt_norm_weight;
     ttt_norm_bias_gl ttt_norm_bias;
 
-    w1_gl w1;
-    b1_gl b1;
-    w2_gl w2;
-    b2_gl b2;
-
     w1_checkpoints_gl w1_checkpoints;
     b1_checkpoints_gl b1_checkpoints;
     w2_checkpoints_gl w2_checkpoints;
@@ -159,6 +160,7 @@ template <int head_dim> struct bwd_globals {
     qkvo_gl grad_L_XK;
     qkvo_gl grad_L_XV;
 
+    const int num_mini_batch;
     const int seq_len;
     const int num_checkpoints;
     const int checkpoint_group_size;
@@ -209,6 +211,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     else
     {
         warpgroup::increase_registers<256>(); // consumer needs all of the registers
+        // I believe there is a restriction on this, the register count should be slightly lower than this
+        // But I don't want to risk changing it for now
     }
     
 
@@ -250,34 +254,32 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     F_vec_acc_type(&grad_L_ttt_norm_weight_smem) = al.allocate<F_vec_acc_type>();
     F_vec_acc_type(&grad_L_ttt_norm_bias_smem) = al.allocate<F_vec_acc_type>();
 
-    CS_vec_acc_type(&std_ln_smem) = al.allocate<CS_vec_acc_type>();//, arrived
-    CS_vec_acc_type(&std_fused_smem) = al.allocate<CS_vec_acc_type>();//, arrived
+    CS_vec_acc_type(&std_ln_smem) = al.allocate<CS_vec_acc_type>();
+    CS_vec_acc_type(&std_fused_smem) = al.allocate<CS_vec_acc_type>();
 
 
-    auto(&bwd_q_smem) = q_smem[0];//, arrived
-    auto(&bwd_k_smem) = k_smem[0];//
-    auto(&bwd_last_eta_smem) = last_eta_smem[0];//
-    auto(&grad_L_XQW_mini_batch_smem) = v_smem[0]; /// Freed, arrived
+    auto(&bwd_q_smem) = q_smem[0];
+    auto(&bwd_k_smem) = k_smem[0];
+    auto(&bwd_last_eta_smem) = last_eta_smem[0];
+    auto(&grad_L_XQW_mini_batch_smem) = v_smem[0];
 
-    auto(&x_hat_ln_smem) = z1_smem; // Freed, arrived
-    // auto(&std_ln_smem)[4] = ln_smem; // Freed
-    auto(&grad_L_Z2_bar_smem) = x2_smem; // Freed
-    auto(&z1_bar_smem) = grad_l_z1_smem; // Freed, arrived
-    auto(&grad_L_Z1_bar_smem) = q_smem[1]; // Freed
-    auto(&x2_bar_smem) = k_smem[1]; // Freed, arrived
-    auto(&grad_l_wrt_Z2_smem) = v_smem[1]; // , arrived
-    auto(&x2_bwd_smem) = z1_smem; ///////// keep forever, arrived
-    auto(&grad_l_wrt_Z1_smem) = grad_l_z1_smem; // freed, arrived
+    auto(&x_hat_ln_smem) = z1_smem;
+    auto(&grad_L_Z2_bar_smem) = x2_smem;
+    auto(&z1_bar_smem) = grad_l_z1_smem;
+    auto(&grad_L_Z1_bar_smem) = q_smem[1];
+    auto(&x2_bar_smem) = k_smem[1];
+    auto(&grad_l_wrt_Z2_smem) = v_smem[1];
+    auto(&x2_bwd_smem) = z1_smem;
+    auto(&grad_l_wrt_Z1_smem) = grad_l_z1_smem;
     auto(&grad_L_grad_l_wrt_Z1_smem) = q_smem[0];
-    auto(&grad_L_grad_l_wrt_Z2_smem) = k_smem[1]; // freed
-    auto(&z1_bwd_smem) = x2_smem;//, arrived
-    auto(&x_hat_fused_smem) = v_smem[0]; // freed, arrived
-    // auto(&std_fused_smem)[4] = ln_smem;
-    auto(&grad_L_grad_x_hat_fused_smem) = q_smem[1]; // Freed
-    auto(&grad_L_reconstruction_target_smem) = grad_l_z1_smem; // freed
-    auto(&grad_output_fused_smem) = cs_f_store2_smem; // freed, arrived
-    auto(&grad_L_x_hat_fused_smem) = q_smem[1]; // freed
-    auto(&grad_x_hat_fused_smem) = grad_l_z1_smem;//, arrived
+    auto(&grad_L_grad_l_wrt_Z2_smem) = k_smem[1];
+    auto(&z1_bwd_smem) = x2_smem;
+    auto(&x_hat_fused_smem) = v_smem[0];
+    auto(&grad_L_grad_x_hat_fused_smem) = q_smem[1];
+    auto(&grad_L_reconstruction_target_smem) = grad_l_z1_smem;
+    auto(&grad_output_fused_smem) = cs_f_store2_smem;
+    auto(&grad_L_x_hat_fused_smem) = q_smem[1];
+    auto(&grad_x_hat_fused_smem) = grad_l_z1_smem;
 
     auto(&grad_L_Z2_smem) = k_smem[1];
     auto(&grad_L_Z1_smem) = v_smem[0];
@@ -297,6 +299,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
 
     // Create locks to make sure reads aren't premature
+    // A lot of these arent needed, but they use so little of smem
+    // I didn't feel like removing the unused ones
     __shared__ kittens::semaphore 
         w1_arrived,
         w2_arrived,
@@ -511,6 +515,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         for (int mini_batch_in_group_idx = 0; mini_batch_in_group_idx < g.checkpoint_group_size; ++mini_batch_in_group_idx)
         {
             const int global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_in_group_idx;
+            if (global_mini_batch_idx >= g.num_mini_batch) continue;
 
             if (is_producer)
             {
@@ -548,6 +553,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_async(g.W2_init_group, w2_smem, {batch_idx, head_idx, mini_batch_in_group_idx * TP + tp_shard_rank, 0});
                     tma::store_async(g.b2_init_group, b2_smem, {batch_idx, head_idx, mini_batch_in_group_idx, 0});
                     tma::store_commit_group();
+                    tma::store_async_wait();
                 }
 
                 rt_fl<16, K::F> cs_cs_fl_reg;
@@ -579,6 +585,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_async(g.X2_group, x2_smem, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank});
                     tma::store_commit_group();
                 }
+
+                tma::store_async_wait();
 
                 zero(cs_cs_fl_reg);
                 warpgroup::load(cs_cs_fl_reg2, w2_smem);
@@ -635,7 +643,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 tma::store_async(g.std_fused_group, ln_smem[wg_warpid], {batch_idx, head_idx, mini_batch_in_group_idx, wg_warpid});
                 tma::store_commit_group();
-                
+                tma::store_async_wait();
                 
                 
                 // compute y
@@ -665,7 +673,9 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_async(g.grad_output_fused_group, cs_f_store_smem, {batch_idx, head_idx, mini_batch_in_group_idx, 0});
                     tma::store_async(g.grad_x_hat_fused_group, cs_f_store2_smem, {batch_idx, head_idx, mini_batch_in_group_idx, 0});
                     tma::store_commit_group();
+                    
                 }
+                tma::store_async_wait();
 
                 warpgroup::load(cs_cs_fl_reg2, z2_smem);
                 mul(cs_cs_fl_reg2, cs_cs_fl_reg, cs_cs_fl_reg2);
@@ -696,6 +706,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_async(g.grad_l_wrt_Z2_group, cs_f_store_smem, {batch_idx, head_idx, mini_batch_in_group_idx, 0});
                     tma::store_commit_group();
                 }
+                tma::store_async_wait();
 
                 // Calculate grad_l_wrt_Z1
                 zero(cs_cs_fl_reg);
@@ -725,6 +736,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_async(g.grad_l_wrt_Z1_group, cs_f_store_smem, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank});
                     tma::store_commit_group();
                 }
+                tma::store_async_wait();
                 
                 // Update W2
                 warpgroup::load(cs_cs_fl_reg, w2_smem);
@@ -769,7 +781,9 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_async(g.X2_bar_group, x2_smem, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank});
                     tma::store_commit_group();
                 }
+                tma::store_async_wait();
 
+                zero(cs_cs_fl_reg);
                 warpgroup::load(cs_cs_fl_reg2, w2_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 warpgroup::sync(warpgroupid+1);
@@ -821,6 +835,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 }
                 tma::store_async(g.std_ln_group, ln_smem[wg_warpid], {batch_idx, head_idx, mini_batch_in_group_idx, wg_warpid});
                 tma::store_commit_group();
+                tma::store_async_wait();
 
                 if (warpgroup::laneid() == 0) arrive(compute_done[curr_stage], 1);
                 
@@ -848,6 +863,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         for (int mini_batch_in_group_idx = g.checkpoint_group_size - 1; mini_batch_in_group_idx >= 0; --mini_batch_in_group_idx)
         {
             const int global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_in_group_idx;
+            if (global_mini_batch_idx >= g.num_mini_batch) continue;
 
             if (is_producer)
             {
@@ -1011,12 +1027,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::store(grad_L_Z1_bar_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
 
-                if (tp_shard_rank == 3 && wg_warpid == 0)
-                {
-                    tma::store_async(g.o, grad_L_Z1_bar_smem, {batch_idx, head_idx, global_mini_batch_idx, 0});
-                    tma::store_commit_group();
-                }
-
                 // grad_L_W1_last
                 warpgroup::load(cs_cs_fl_reg2, grad_L_W1_smem);
                 kittens::wait(bwd_q_sem_arrived, bwd_semaphore_phase);
@@ -1081,14 +1091,15 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 //////// FREE GRAD_L_Z1_BAR
 
-                warpgroup::store(matmul_smem, cs_cs_fl_reg);
+                warpgroup::store(cs_f_store2_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
 
                 if (wg_warpid == 0)
                 {
-                    tma::store_add_async(g.grad_L_XQ, matmul_smem, {batch_idx, head_idx, global_mini_batch_idx, 0});
+                    tma::store_add_async(g.grad_L_XQ, cs_f_store2_smem, {batch_idx, head_idx, global_mini_batch_idx, 0});
                     tma::store_commit_group();
                 }
+                tma::store_async_wait();
 
                 // grad_L_last_eta_in_mini_batch
                 warpgroup::load(cs_cs_fl_reg, grad_L_W2_smem);
@@ -1262,8 +1273,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_add_async(g.grad_L_XK, cs_f_store_smem, {batch_idx, head_idx, global_mini_batch_idx, 0});
                     tma::store_commit_group();
                 }
-
-                if (warpgroup::laneid() == 0) arrive(grad_L_reconstruction_target_freed, 1);
+                tma::store_async_wait();
 
                 
                 warpgroup::sync(warpgroupid+1);
@@ -1290,6 +1300,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg2, grad_L_grad_x_hat_fused_smem);
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 warpgroup::load(cs_cs_fl_reg2, b_acc_smem);
+                if (warpgroup::laneid() == 0) arrive(grad_L_reconstruction_target_freed, 1);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 warpgroup::store(b_acc_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
@@ -1501,15 +1512,11 @@ torch::Tensor ttt_backward(
     const torch::Tensor last_eta,
     const torch::Tensor ttt_norm_weight,
     const torch::Tensor ttt_norm_bias,
-    const torch::Tensor W1,
-    const torch::Tensor b1,
-    const torch::Tensor W2,
-    const torch::Tensor b2,
     const torch::Tensor W1_checkpoints,
     const torch::Tensor b1_checkpoints,
     const torch::Tensor W2_checkpoints,
     const torch::Tensor b2_checkpoints,
-    const torch::Tensor Out,
+    const torch::Tensor Out, // Unused
     const torch::Tensor W1_init_group,
     const torch::Tensor b1_init_group,
     const torch::Tensor W2_init_group,
@@ -1540,7 +1547,8 @@ torch::Tensor ttt_backward(
     const torch::Tensor grad_L_last_eta,
     const torch::Tensor grad_L_XQ,
     const torch::Tensor grad_L_XK,
-    const torch::Tensor grad_L_XV
+    const torch::Tensor grad_L_XV,
+    const int checkpoint_group_size
 ) {
     constexpr int F = 64;
     constexpr int K = 4;
@@ -1550,18 +1558,13 @@ torch::Tensor ttt_backward(
     const unsigned long NC = XQ.size(2);
     const unsigned long CS = XQ.size(3);
     const unsigned long num_checkpoints = static_cast<int>(W1_checkpoints.size(2));
-    const unsigned long checkpoint_group_size = NC / num_checkpoints;
-
-    TORCH_CHECK(NC % num_checkpoints == 0, "N % R == 0");
     
+    // Probably could have better checks over here
     TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 5 && XQ.size(4) == F, "Invalid dims for XQ");
     TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 5 && XK.size(4) == F, "Invalid dims for XK");
     TORCH_CHECK(XV.device().is_cuda() && XV.is_contiguous() && XV.dim() == 5 && XV.size(4) == F, "Invalid dims for XV");
-    TORCH_CHECK(W1.device().is_cuda() && W1.is_contiguous() && W1.dim() == 4 && W1.size(0) == B && W1.size(1) == H && W1.size(2) == F && W1.size(3) == F*K, "Invalid dims for W1");
-    TORCH_CHECK(W2.device().is_cuda() && W2.is_contiguous() && W2.dim() == 4 && W2.size(0) == B && W2.size(1) == H && W2.size(2) == F*K && W2.size(3) == F, "Invalid dims for W2");
     TORCH_CHECK(W1_checkpoints.device().is_cuda() && W1_checkpoints.is_contiguous() && W1_checkpoints.dim() == 5 && W1_checkpoints.size(0) == B && W1_checkpoints.size(1) == H && W1_checkpoints.size(2) == num_checkpoints && W1_checkpoints.size(3) == F && W1_checkpoints.size(4) == F*K, "Invalid dims for W1_checkpoints");
     TORCH_CHECK(W2_checkpoints.device().is_cuda() && W2_checkpoints.is_contiguous() && W2_checkpoints.dim() == 5 && W2_checkpoints.size(0) == B && W2_checkpoints.size(1) == H && W2_checkpoints.size(2) == num_checkpoints && W2_checkpoints.size(3) == F*K && W2_checkpoints.size(4) == F, "Invalid dims for W2_checkpoints");
-    TORCH_CHECK(Out.device().is_cuda() && Out.is_contiguous() && Out.dim() == 5 && Out.size(4) == F, "Invalid dims for Out");
 
     TORCH_CHECK(ttt_norm_weight.device().is_cuda() && ttt_norm_weight.is_contiguous() && ttt_norm_weight.dim() == 4 && ttt_norm_weight.size(0) == 1 && ttt_norm_weight.size(1) == H && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(3) == F, "Invalid dims for ttt_norm_weight");
 
@@ -1599,11 +1602,6 @@ torch::Tensor ttt_backward(
 
     F_vec_acc_gl ttt_norm_weight_gl{reinterpret_cast<float*>(ttt_norm_weight.data_ptr<float>()), 1, H, 1, F};
     F_vec_acc_gl ttt_norm_bias_gl{reinterpret_cast<float*>(ttt_norm_bias.data_ptr<float>()), 1, H, 1, F};
-
-    F_F_tile_acc_gl w1_init_gl{reinterpret_cast<float*>(W1.data_ptr<float>()), B, H, F, F*K};
-    F_vec_acc_gl b1_init_gl{reinterpret_cast<float*>(b1.data_ptr<float>()), B, H, 1, F*K};
-    F_F_tile_acc_gl w2_init_gl{reinterpret_cast<float*>(W2.data_ptr<float>()), B, H, F*K, F};
-    F_vec_acc_gl b2_init_gl{reinterpret_cast<float*>(b2.data_ptr<float>()), B, H, 1, F};
 
     F_F_tile_acc_gl w1_checkpoints_gl{reinterpret_cast<float*>(W1_checkpoints.data_ptr<float>()), B, H, num_checkpoints*F, F*K};
     F_vec_acc_gl b1_checkpoints_gl{reinterpret_cast<float*>(b1_checkpoints.data_ptr<float>()), B, H, num_checkpoints, F*K};
@@ -1657,10 +1655,6 @@ torch::Tensor ttt_backward(
         last_eta_gl,
         ttt_norm_weight_gl,
         ttt_norm_bias_gl,
-        w1_init_gl, 
-        b1_init_gl,
-        w2_init_gl, 
-        b2_init_gl,
         w1_checkpoints_gl, 
         b1_checkpoints_gl,
         w2_checkpoints_gl, 
@@ -1698,6 +1692,7 @@ torch::Tensor ttt_backward(
         grad_L_XQ_gl,
         grad_L_XK_gl,
         grad_L_XV_gl,
+        static_cast<int>(NC),
         static_cast<int>(T),
         static_cast<int>(num_checkpoints),
         static_cast<int>(checkpoint_group_size)

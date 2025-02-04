@@ -818,7 +818,8 @@ def main():
             b1_checkpoints,
             W2_checkpoints,
             b2_checkpoints,
-            output_tk
+            output_tk,
+            checkpoint_group_size
         )
 
     print("Starting tk kernel")
@@ -839,7 +840,8 @@ def main():
             b1_checkpoints,
             W2_checkpoints,
             b2_checkpoints,
-            output_tk
+            output_tk,
+            checkpoint_group_size
         )
 
     end = time.perf_counter()  # End the timer
@@ -860,7 +862,6 @@ def main():
 
     print(f"M1 runtime={m1_runtime} seconds")
 
-
     # thunderkittens.ttt_forward(
     #     xq,
     #     xk,
@@ -876,7 +877,8 @@ def main():
     #     b1_checkpoints,
     #     W2_checkpoints,
     #     b2_checkpoints,
-    #     output_tk
+    #     output_tk,
+    #     checkpoint_group_size
     # )
 
     # _, _, _, _, _, ttt_norm_weight, ttt_norm_bias, W1_init, b1_init, W2_init, b2_init = get_inputs(torch.bfloat16)
@@ -963,11 +965,11 @@ def main():
     # print("Comparing Outputs")
 
     # # breakpoint()
-    # print(output_ref)
-    # print(output_tk)
-    # print(output_ref_bf)
-    # compare_outputs(output_ref[:,:,-1], output_ref_bf[:,:,-1].to(torch.float32), "Output baseline precision diff")
-    # compare_outputs(output_tk[:,:,-1], output_ref[:,:,-1], "Output")
+    # # print(output_ref)
+    # # print(output_tk)
+    # # print(output_ref_bf)
+    # compare_outputs(output_ref, output_ref_bf.to(torch.float32), "Output baseline precision diff")
+    # compare_outputs(output_tk, output_ref, "Output")
 
     # compare_outputs(W1_checkpoints[:, :, -1], W1_checkpoints_ref[:, :, -1], "W1")
     # compare_outputs(b1_checkpoints[:, :, -1], b1_checkpoints_ref[:, :, -1], "b1")

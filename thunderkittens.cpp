@@ -40,7 +40,8 @@ extern torch::Tensor ttt_forward(
     const torch::Tensor b1_checkpoints,
     const torch::Tensor W2_checkpoints,
     const torch::Tensor b2_checkpoints,
-    const torch::Tensor Out
+    const torch::Tensor Out,
+    const int checkpoint_group_size
 );
 #endif
 
@@ -53,10 +54,6 @@ extern torch::Tensor ttt_backward(
     const torch::Tensor last_eta,
     const torch::Tensor ttt_norm_weight,
     const torch::Tensor ttt_norm_bias,
-    const torch::Tensor W1,
-    const torch::Tensor b1,
-    const torch::Tensor W2,
-    const torch::Tensor b2,
     const torch::Tensor W1_checkpoints,
     const torch::Tensor b1_checkpoints,
     const torch::Tensor W2_checkpoints,
@@ -92,7 +89,8 @@ extern torch::Tensor ttt_backward(
     const torch::Tensor grad_L_last_eta,
     const torch::Tensor grad_L_XQ,
     const torch::Tensor grad_L_XK,
-    const torch::Tensor grad_L_XV
+    const torch::Tensor grad_L_XV,
+    const int checkpoint_group_size
 );
 #endif
 

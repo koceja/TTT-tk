@@ -2,6 +2,7 @@ import torch
 import thunderkittens
 import multiprocessing
 import time
+import math
 
 from kernels.ttt_backward.triton_comps.linear_backward import ttt_linear_scan_backward
 
@@ -438,7 +439,7 @@ def backward(
         grad_L_XV,
         grad_L_XK,
         grad_L_eta,
-        (grad_L_Z1_bar)[:,:,:,192:]
+        grad_L_reconstruction_target
     )
 
 
@@ -1882,15 +1883,16 @@ def main():
     # match_backward_pytorch()
     torch.manual_seed(0)
     # Define shapes
-    B = 4
+    B = 16
     NH = 48
-    K = 1
     
-    seq_len = 64
+    
+    seq_len = 320
     mini_batch_size = 64
     CS = mini_batch_size
     NC = seq_len // mini_batch_size
-    checkpoint_group_size = NC // K
+    checkpoint_group_size = 2
+    K = math.ceil(NC / checkpoint_group_size)
 
     head_dim = 64
     F = head_dim
@@ -1905,11 +1907,11 @@ def main():
     def get_inputs(dtype):
         torch.manual_seed(0)
         # Create inputs
-        xq = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-        xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-        xv = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xq = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xk = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xv = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
-        eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous() * 0.1
+        eta = torch.ones(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous() * 0.02
         last_eta = eta[:, :, :, -1, :, None].contiguous()
 
         ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
@@ -1930,10 +1932,10 @@ def main():
     XV_batch = XV_batch.to(torch.bfloat16).contiguous()
     last_eta = last_eta.to(torch.bfloat16).contiguous()
 
-    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
-    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
-    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
-    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W1_checkpoints = torch.ones(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b1_checkpoints = torch.ones(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W2_checkpoints = torch.ones(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b2_checkpoints = torch.ones(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
     output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
     output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
@@ -1942,7 +1944,7 @@ def main():
     grad_L_W2_last = torch.zeros(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
     grad_L_b2_last = torch.zeros(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
     # grad_L_XQW_mini_batch = torch.arange(B* NH* NC* mini_batch_size* head_dim).to(torch.bfloat16).to(device).view(B, NH, NC, mini_batch_size, head_dim).contiguous() * 0.02
-    grad_L_XQW_mini_batch = (torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device)* 0.02).contiguous()
+    grad_L_XQW_mini_batch = (torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device)).contiguous()
 
     grad_L_ttt_norm_weight = torch.zeros(B, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
     grad_L_ttt_norm_bias = torch.zeros(B, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
@@ -1956,46 +1958,46 @@ def main():
     grad_L_last_eta = torch.zeros_like(last_eta).contiguous()
 
     # TK rematted values
-    W1_init_group = torch.zeros(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32).contiguous()
-    b1_init_group = torch.zeros(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32).contiguous()
-    W2_init_group = torch.zeros(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32).contiguous()
-    b2_init_group = torch.zeros(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32).contiguous()
+    W1_init_group = torch.ones(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32).contiguous() * 0.02
+    b1_init_group = torch.ones(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32).contiguous() * 0.02
+    W2_init_group = torch.ones(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32).contiguous() * 0.02
+    b2_init_group = torch.ones(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32).contiguous() * 0.02
 
-    x_hat_ln_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
-    std_ln_group = torch.zeros(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32).contiguous()
+    x_hat_ln_group = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    std_ln_group = torch.ones(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32).contiguous()
 
-    X2_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
-    Z1_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
-    Z1_bar_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
-    X2_bar_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    X2_group = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    Z1_group = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    Z1_bar_group = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    X2_bar_group = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
 
-    grad_l_wrt_Z2_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
-    grad_l_wrt_Z1_group = torch.zeros(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
-    x_hat_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
-    grad_x_hat_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
-    grad_output_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
-    std_fused_group = torch.zeros(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32).contiguous()
+    grad_l_wrt_Z2_group = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    grad_l_wrt_Z1_group = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=dtype).contiguous()
+    x_hat_fused_group = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    grad_x_hat_fused_group = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    grad_output_fused_group = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=dtype).contiguous()
+    std_fused_group = torch.ones(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32).contiguous()
 
     # Ref rematted values
-    W1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32)
-    b1_init_group_ref = torch.empty(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32)
-    W2_init_group_ref = torch.empty(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32)
-    b2_init_group_ref = torch.empty(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32)
+    W1_init_group_ref = torch.ones(B, NH, checkpoint_group_size, F, F * 4, device=device, dtype=torch.float32) * 0.02
+    b1_init_group_ref = torch.ones(B, NH, checkpoint_group_size, 1, F * 4, device=device, dtype=torch.float32) * 0.02
+    W2_init_group_ref = torch.ones(B, NH, checkpoint_group_size, F * 4, F, device=device, dtype=torch.float32) * 0.02
+    b2_init_group_ref = torch.ones(B, NH, checkpoint_group_size, 1, F, device=device, dtype=torch.float32) * 0.02
 
-    x_hat_ln_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    std_ln_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+    x_hat_ln_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    std_ln_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
 
-    X2_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    Z1_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    Z1_bar_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    X2_bar_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    X2_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    Z1_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    Z1_bar_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    X2_bar_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
 
-    grad_l_wrt_Z2_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    grad_l_wrt_Z1_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
-    x_hat_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    grad_x_hat_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    grad_output_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
-    std_fused_group_ref = torch.empty(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
+    grad_l_wrt_Z2_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    grad_l_wrt_Z1_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F * 4, device=device, dtype=torch.float32)
+    x_hat_fused_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    grad_x_hat_fused_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    grad_output_fused_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, F, device=device, dtype=torch.float32)
+    std_fused_group_ref = torch.ones(B, NH, checkpoint_group_size, CS, 1, device=device, dtype=torch.float32)
 
     grad_L_ttt_norm_weight_ref = torch.zeros(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
     grad_L_ttt_norm_bias_ref = torch.zeros(1, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
@@ -2137,6 +2139,56 @@ def main():
     # elapsed_time = (end_tk - start_tk) / 50
     # print(f"TK time: {elapsed_time:.6f} seconds")
     # print("Finished tk kernel")
+
+    W1_curr, b1_curr, W2_curr, b2_curr = (W1_init, b1_init, W2_init, b2_init)
+
+    for i in range(NC):
+        if i % checkpoint_group_size == 0:
+            checkpoint_idx = i // checkpoint_group_size
+            W1_checkpoints[:, :, checkpoint_idx] = W1_curr
+            b1_checkpoints[:, :, checkpoint_idx] = b1_curr
+            W2_checkpoints[:, :, checkpoint_idx] = W2_curr
+            b2_checkpoints[:, :, checkpoint_idx] = b2_curr
+
+        xq_mb = XQ_batch[:,:,i].to(torch.float32)
+        xk_mb = XK_batch[:,:,i].to(torch.float32)
+        xv_mb = XV_batch[:,:,i].to(torch.float32)
+        eta_mb = eta_batch[:, :, i].to(torch.float32)
+
+        # Z2_bar_pt_shard[i], W1_other, b1_other, W2_other, b2_other = compute_mini_batch_shard(W1[0][0], b1[0][0], W2[0][0], b2[0][0], xq_mb[0][0], xk_mb[0][0], xv_mb[0][0], shard_size)
+        (
+            output_ref[:, :, i],
+            W1_curr,
+            b1_curr,
+            W2_curr,
+            b2_curr,
+            Z1_curr,
+            std_fused_curr,
+            x_hat_fused_curr,
+            grad_output_fused_curr,
+            grad_x_hat_fused_curr,
+            grad_l_wrt_Z2_curr,
+            grad_l_wrt_Z1_curr,
+            X2_curr,
+            Z1_bar_curr,
+            X2_bar_curr,
+            std_ln_curr,
+            x_hat_ln_curr,
+            _
+        ) = compute_mini_batch_no_dual(
+            W1_curr, 
+            b1_curr, 
+            W2_curr, 
+            b2_curr, 
+            xq_mb, 
+            xk_mb, 
+            xv_mb, 
+            eta_mb,
+            ttt_norm_weight,
+            ttt_norm_bias
+        )
+
+
    
     thunderkittens.ttt_backward(
         # Inputs
@@ -2146,10 +2198,6 @@ def main():
         last_eta.contiguous(),
         ttt_norm_weight.contiguous(),
         ttt_norm_bias.contiguous(),
-        W1_init.contiguous(),
-        b1_init.contiguous(),
-        W2_init.contiguous(),
-        b2_init.contiguous(),
         # Checkpoints
         W1_checkpoints.contiguous(),
         b1_checkpoints.contiguous(),
@@ -2190,6 +2238,7 @@ def main():
         grad_L_XQ.contiguous(),
         grad_L_XK.contiguous(),
         grad_L_XV.contiguous(),
+        checkpoint_group_size
     )
 
     grad_L_ttt_norm_weight = grad_L_ttt_norm_weight.sum(dim=0)
@@ -2221,6 +2270,8 @@ def main():
 
         for i in range(checkpoint_group_size):
             global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + i
+            if global_mini_batch_idx >= NC: continue
+
             xq_mb = XQ_batch[:,:,global_mini_batch_idx]
             xk_mb = XK_batch[:,:,global_mini_batch_idx]
             xv_mb = XV_batch[:,:,global_mini_batch_idx]
@@ -2269,6 +2320,7 @@ def main():
 
         for i in range(checkpoint_group_size - 1, -1, -1):
             global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + i
+            if global_mini_batch_idx >= NC: continue
             xq_mb = XQ_batch[:,:,global_mini_batch_idx]
             xk_mb = XK_batch[:,:,global_mini_batch_idx]
             xv_mb = XV_batch[:,:,global_mini_batch_idx]
@@ -2411,6 +2463,6 @@ if __name__ == '__main__':
         main()
     else:
         try:
-            kernel_with_timeout(main, timeout=240)
+            kernel_with_timeout(main, timeout=30)
         except RuntimeError as e:
             print(e)
