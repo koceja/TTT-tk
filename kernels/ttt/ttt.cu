@@ -36,10 +36,6 @@ template <int head_dim> struct fwd_globals {
     using F_vec_type = sv_bf<fwd_ttt_mlp_ker_tile_dims<head_dim>::F>;
     using CS_vec_acc_type = sv_fl<fwd_ttt_mlp_ker_tile_dims<head_dim>::mini_batch_size>;
     using F_vec_acc_type = sv_fl<fwd_ttt_mlp_ker_tile_dims<head_dim>::F>;
-    // using tile_type = st_bf<fwd_ttt_mlp_ker_tile_dims<head_dim>::tile_height, fwd_ttt_mlp_ker_tile_dims<head_dim>::tile_width>;
-    // using tile_acc_type = st_fl<fwd_ttt_mlp_ker_tile_dims<head_dim>::tile_height, fwd_ttt_mlp_ker_tile_dims<head_dim>::tile_width>;
-    // using vec_type = sv_bf<fwd_ttt_mlp_ker_tile_dims<head_dim>::tile_height>;
-    // using vec_acc_type = sv_fl<fwd_ttt_mlp_ker_tile_dims<head_dim>::tile_height>;
 
     // Global memory layout
     using q_gl = gl<bf16, -1, -1, -1, -1, CS_F_tile_type>;
@@ -104,11 +100,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     using F_vec_type = fwd_globals<head_dim>::F_vec_type;
     using CS_vec_acc_type = fwd_globals<head_dim>::CS_vec_acc_type;
     using F_vec_acc_type = fwd_globals<head_dim>::F_vec_acc_type;
-    
-    // using tile_type = st_bf<K::tile_height, K::tile_width>;
-    // using tile_acc_type = st_fl<K::tile_height, K::tile_width>;
-    // using vec_type = sv_bf<K::tile_height>;
-    // using vec_acc_type = sv_fl<K::tile_height>;
 
     cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
     const int tp = cluster.block_rank();
@@ -157,11 +148,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
     // Reinterpretations for intermediates
     auto(&reduction_buffer) = matmul_smem[0];
     auto(&z2_smem)[CONSUMER_WARPGROUPS] = grad_l_z1_smem;
-    auto(&grad_l_z2_smem)[K::stages] = v_smem; // TODO: This is most definitely a bug
-    // auto(&bf_tile_smem)[CONSUMER_WARPGROUPS] = v_smem;
-    // auto(*x2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
-    // auto(*z2_bar_smem) = reinterpret_cast<tile_type(*)>(z1_smem);
-
+    auto(&grad_l_z2_smem)[K::stages] = v_smem;
 
     // Create locks to make sure reads aren't premature
     __shared__ kittens::semaphore 
@@ -310,21 +297,16 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 tma::store_commit_group();
             }
 
-
-
-
             const int curr_stage = idx % K::stages;
             const int curr_stage_lock_phase = (idx / K::stages) % 2;
 
             // Hidden state forward
             kittens::wait(k_sem_arrived[curr_stage], (idx / K::stages) % 2);
             
-            
             zero(cs_cs_fl_reg);
             warpgroup::load(cs_cs_fl_reg2, w1_smem[warpgroupid]);
             warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
             warpgroup::sync(warpgroupid+1);
-            // warpgroup::copy(matmul_smem[warpgroupid], w1_smem[warpgroupid]);
             warpgroup::mm_AB(cs_cs_fl_reg, k_smem[idx % K::stages], matmul_smem[warpgroupid]);
             load(cs_row_fl_reg, b1_smem[warpgroupid]);
             warpgroup::mma_async_wait();
@@ -341,7 +323,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::load(cs_cs_fl_reg2, w2_smem[warpgroupid]);
             warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
             warpgroup::sync(warpgroupid+1);
-            // warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
             warpgroup::mm_AB(cs_cs_fl_reg, x2_smem[warpgroupid], matmul_smem[warpgroupid]);
             warpgroup::mma_async_wait();
             // Only add b2 to one of the sharded Z2
@@ -361,7 +342,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 // Reduce intra CTA Z2 before inter CTA reduce
                 warpgroup::add(z2_smem[0], z2_smem[0], z2_smem[1]);
                 warpgroup::sync(warpgroupid+4);
-                // warpgroup::add(z2_smem[0], z2_smem[0], z2_smem[1]); // Ideally we can do an atomic store into shared memory
                 if (wg_warpid == 0) tma::expect_bytes(dsmem_semaphore, sizeof(reduction_buffer));
                 tma::cluster::sync();
                 if (wg_warpid == 0) tma::cluster::store_async(reduction_buffer, z2_smem[0], tp ^ 1, dsmem_semaphore);
@@ -438,9 +418,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, -1.0f); // negate to prepare for grad step
                 kittens::wait(last_eta_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
-                // rv_fl<K::mini_batch_size> cs_fl_vec_reg;
-                // warpgroup::load(cs_fl_vec_reg, last_eta_smem[idx % K::stages]);
-                // add_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_fl_vec_reg); // apply ilr
 
                 warpgroup::store(grad_l_z2_smem[curr_stage], cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
@@ -458,25 +435,8 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             if (warpgroup::laneid() == 0) arrive(reduction_done, 1);
             kittens::wait(reduction_done, idx % 2);
 
-            // // warpgroup::store(z2_smem[0], cs_cs_fl_reg);
-            // warpgroup::sync(warpgroupid+4);
-            // // Store output to global
-            // if (tp_shard_rank == 1 && wg_warpid == 0) {
-            //     tma::store_async(g.o, grad_l_z2_smem[curr_stage], {batch_idx, head_idx, idx, 0});
-            //     tma::store_commit_group();
-            // }
-
-            // warpgroup::store(z2_smem[0], cs_cs_fl_reg);
-            // warpgroup::sync(1);
-            // // Store output to global
-            // if (wg_warpid == 0) {
-            //     tma::store_async(g.o, grad_l_z2_smem, {batch_idx, head_idx, idx, 0});
-            //     tma::store_commit_group();
-            // }
-
             // Calculate grad_l_wrt_Z1
             zero(cs_cs_fl_reg);
-            // warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
             warpgroup::load(cs_cs_fl_reg2, w2_smem[warpgroupid]);
             warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
             warpgroup::sync(warpgroupid+1);
@@ -504,10 +464,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 warpgroup::copy(b_acc_smem[0], grad_l_z2_smem[curr_stage]);
                 warpgroup::col_sum(b2_smem, b_acc_smem[0], b2_smem);
                 warpgroup::sync(warpgroupid+1);
-                // warpgroup::load(cs_cs_fl_reg, grad_l_z2_smem);
-                // load(cs_row_fl_reg, b2_smem);
-                // col_sum(cs_row_fl_reg,cs_cs_fl_reg);
-                // store(b2_smem, cs_row_fl_reg);
             }
 
             // Update W1
@@ -520,10 +476,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Update b1
             warpgroup::copy(b_acc_smem[warpgroupid], grad_l_z1_smem[warpgroupid]);
             warpgroup::col_sum(b1_smem[warpgroupid], b_acc_smem[warpgroupid], b1_smem[warpgroupid]);
-            // warpgroup::load(cs_cs_fl_reg, grad_l_z1_smem[warpgroupid]);
-            // load(cs_row_fl_reg, b1_smem[warpgroupid]);
-            // col_sum(cs_row_fl_reg, cs_cs_fl_reg);
-            // store(b1_smem[warpgroupid], cs_row_fl_reg);
 
             warpgroup::sync(warpgroupid+1);
             
@@ -531,7 +483,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Compute output
             zero(cs_cs_fl_reg);
             kittens::wait(q_sem_arrived[idx % K::stages], (idx / K::stages) % 2);
-            // warpgroup::copy(matmul_smem[warpgroupid], w1_smem[warpgroupid]);
             warpgroup::load(cs_cs_fl_reg2, w1_smem[warpgroupid]);
             warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
             warpgroup::sync(warpgroupid+1);
@@ -547,15 +498,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::store(x2_smem[warpgroupid], cs_cs_fl_reg);
             warpgroup::sync(warpgroupid+1);
 
-            // // warpgroup::store(z2_smem[warpgroupid], cs_cs_fl_reg);
-            // warpgroup::sync(warpgroupid+1);
-            // // Store output to global
-            // if (tp_shard_rank == 0 && wg_warpid == 0) {
-            //     tma::store_async(g.o, x2_smem[warpgroupid], {batch_idx, head_idx, idx, 0});
-            //     tma::store_commit_group();
-            // }
-
-            // warpgroup::copy(matmul_smem[warpgroupid], w2_smem[warpgroupid]);
             warpgroup::load(cs_cs_fl_reg2, w2_smem[warpgroupid]);
             warpgroup::sync(warpgroupid+1);
             warpgroup::store(matmul_smem[warpgroupid], cs_cs_fl_reg2);
@@ -584,7 +526,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 // Reduce intra CTA Z2 before inter CTA reduce
                 warpgroup::add(z2_smem[0], z2_smem[0], z2_smem[1]);
                 warpgroup::sync(warpgroupid+4);
-                // warpgroup::add(z2_smem[0], z2_smem[0], z2_smem[1]); // Ideally we can do an atomic store into shared memory
                 if (wg_warpid == 0) tma::expect_bytes(second_dsmem_semaphore, sizeof(reduction_buffer));
                 tma::cluster::sync();
                 if (wg_warpid == 0) tma::cluster::store_async(reduction_buffer, z2_smem[0], tp ^ 1, second_dsmem_semaphore);
@@ -633,8 +574,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 add_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg); // y
 
                 // Residual
-                // warpgroup::copy(z2_smem[1], q_smem[idx % K::stages]);
-                // warpgroup::add(z2_smem[0], z2_smem[0], q_smem[idx % K::stages]);
                 warpgroup::load(cs_cs_fl_reg2, q_smem[idx % K::stages]);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 

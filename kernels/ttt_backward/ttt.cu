@@ -212,7 +212,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     {
         warpgroup::increase_registers<256>(); // consumer needs all of the registers
         // I believe there is a restriction on this, the register count should be slightly lower than this
-        // But I don't want to risk changing it for now
     }
     
 
@@ -284,13 +283,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     auto(&grad_L_Z2_smem) = k_smem[1];
     auto(&grad_L_Z1_smem) = v_smem[0];
     auto(&grad_L_XK_smem) = q_smem[1];
-
-    // auto(&grad_L_Z1_bar_smem)
-
-    // cs_f_store_smem
-    // cs_f_store2_smem
-    // auto(&grad_L_ln_bias_ln) = z1_smem;
-
 
     // Reinterpretations for intermediates
     auto(&reduction_buffer) = matmul_smem;

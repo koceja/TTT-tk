@@ -62,10 +62,17 @@ for k in kernels:
     cpp_flags.append(f'-DTK_COMPILE_{k.replace(" ", "_").upper()}')
 
 setup(
-    name='thunderkittens',
+    name='ttt_tk',
+    version='0.1.0',
+    author='Daniel Koceja',
+    author_email='dankoceja@gmail.com',
+    description='A library for test-time training kernels written in thunderkittens',
+    long_description=open('README.md').read(),
+    long_description_content_type='text/markdown',
+    url='https://github.com/koceja/TTT-tk',
     ext_modules=[
         CUDAExtension(
-            'thunderkittens',
+            'ttt_tk',
             sources=source_files, 
             extra_compile_args={'cxx' : cpp_flags,
                                 'nvcc' : cuda_flags}, 
