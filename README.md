@@ -1,17 +1,17 @@
-# TTT-tk
+# TTT
 
-TTT-tk is a repository for test-time training kernels written in Thunderkittens.
+TTT is a repository for test-time training kernels.
 
 Currently, we only support non-causal TTT-MLP kernels with head dimension of 64. Remat is automatically supported with these kernels.
 
 Here is an example on how to invoke the kernels.
 
 ```python
-import ttt_tk
+import test_time_training as ttt
 
 
 # Both ttt-mlp
-ttt_tk.ttt_forward(
+ttt.ttt_forward(
     XQ_batch.contiguous(),
     XK_batch.contiguous(),
     XV_batch.contiguous(),
@@ -30,7 +30,7 @@ ttt_tk.ttt_forward(
     checkpoint_group_size
 )
 
-ttt_tk.ttt_backward(
+ttt.ttt_backward(
     # Forward inputs
     XQ_batch.contiguous(),
     XK_batch.contiguous(),
@@ -95,7 +95,7 @@ Installation requires CUDA drivers or toolkit (v 12.3+) and g++ v10+
 
 ### Pip
 ```bash
-pip install ttt_tk
+pip install test_time_training
 ```
 
 ### From source
