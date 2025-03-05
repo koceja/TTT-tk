@@ -5,13 +5,19 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 from config import sources, target, kernels
 target = target.lower()
 
+# Emulate the env.src settings (set environment variables)
+os.environ["PYTHONPATH"] = os.path.join(os.getcwd(), "src/common/pyutils")
+os.environ["THUNDERKITTENS_ROOT"] = os.getcwd()
+os.environ["LIBTORCH_PATH"] = os.path.join(os.getcwd(), "libtorch")
+
+
 # Set environment variables
 thunderkittens_root = os.getenv('THUNDERKITTENS_ROOT', os.path.abspath(os.path.join(os.getcwd(), '.')))
 python_include = subprocess.check_output(['python', '-c', "import sysconfig; print(sysconfig.get_path('include'))"]).decode().strip()
 torch_include = subprocess.check_output(['python', '-c', "import torch; from torch.utils.cpp_extension import include_paths; print(' '.join(['-I' + p for p in include_paths()]))"]).decode().strip()
-print('Thunderkittens root:', thunderkittens_root)
-print('Python include:', python_include)
-print('Torch include directories:', torch_include)
+# print('Thunderkittens root:', thunderkittens_root)
+# print('Python include:', python_include)
+# print('Torch include directories:', torch_include)
 
 # CUDA flags
 cuda_flags = [
@@ -62,17 +68,21 @@ for k in kernels:
     cpp_flags.append(f'-DTK_COMPILE_{k.replace(" ", "_").upper()}')
 
 setup(
-    name='ttt_tk',
-    version='0.1.0',
+    name='test_time_training',
+    version='0.10.0',
     author='Daniel Koceja',
     author_email='dankoceja@gmail.com',
-    description='A library for test-time training kernels written in thunderkittens',
+    description='A library for test-time training.',
     long_description=open('README.md').read(),
     long_description_content_type='text/markdown',
+    include_package_data=True,
     url='https://github.com/koceja/TTT-tk',
+    install_requires=[
+        'torch>=2.4.0',
+    ],
     ext_modules=[
         CUDAExtension(
-            'ttt_tk',
+            'test_time_training',
             sources=source_files, 
             extra_compile_args={'cxx' : cpp_flags,
                                 'nvcc' : cuda_flags}, 
