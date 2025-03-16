@@ -1497,19 +1497,268 @@ torch::Tensor ttt_backward(
     constexpr int K = 4;
     const unsigned long B = XQ.size(0);
     const unsigned long H = XQ.size(1);
+    const unsigned long NH = XQ.size(1);
     const unsigned long T = XQ.size(2) * XQ.size(3); // seq len
     const unsigned long NC = XQ.size(2);
     const unsigned long CS = XQ.size(3);
     const unsigned long num_checkpoints = static_cast<int>(W1_checkpoints.size(2));
     
-    // Probably could have better checks over here
-    TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 5 && XQ.size(4) == F, "Invalid dims for XQ");
-    TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 5 && XK.size(4) == F, "Invalid dims for XK");
-    TORCH_CHECK(XV.device().is_cuda() && XV.is_contiguous() && XV.dim() == 5 && XV.size(4) == F, "Invalid dims for XV");
-    TORCH_CHECK(W1_checkpoints.device().is_cuda() && W1_checkpoints.is_contiguous() && W1_checkpoints.dim() == 5 && W1_checkpoints.size(0) == B && W1_checkpoints.size(1) == H && W1_checkpoints.size(2) == num_checkpoints && W1_checkpoints.size(3) == F && W1_checkpoints.size(4) == F*K, "Invalid dims for W1_checkpoints");
-    TORCH_CHECK(W2_checkpoints.device().is_cuda() && W2_checkpoints.is_contiguous() && W2_checkpoints.dim() == 5 && W2_checkpoints.size(0) == B && W2_checkpoints.size(1) == H && W2_checkpoints.size(2) == num_checkpoints && W2_checkpoints.size(3) == F*K && W2_checkpoints.size(4) == F, "Invalid dims for W2_checkpoints");
+    // Only perform the checks on the first call.
+    static bool checks_done = false;
+    if (!checks_done) {
+        TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 5 && XQ.size(4) == F, "Encountered error with XQ, please check the shape and if it is contiguous.");
+        TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 5 && XK.size(4) == F, "Encountered error with XK, please check the shape and if it is contiguous.");
+        TORCH_CHECK(XV.device().is_cuda() && XV.is_contiguous() && XV.dim() == 5 && XV.size(4) == F, "Encountered error with XV, please check the shape and if it is contiguous.");
+        TORCH_CHECK(W1_checkpoints.device().is_cuda() && W1_checkpoints.is_contiguous() && W1_checkpoints.dim() == 5 && W1_checkpoints.size(0) == B && W1_checkpoints.size(1) == H && W1_checkpoints.size(2) == num_checkpoints && W1_checkpoints.size(3) == F && W1_checkpoints.size(4) == F*K, "Encountered error with W1_checkpoints, please check the shape and if it is contiguous.");
+        TORCH_CHECK(W2_checkpoints.device().is_cuda() && W2_checkpoints.is_contiguous() && W2_checkpoints.dim() == 5 && W2_checkpoints.size(0) == B && W2_checkpoints.size(1) == H && W2_checkpoints.size(2) == num_checkpoints && W2_checkpoints.size(3) == F*K && W2_checkpoints.size(4) == F, "Encountered error with W2_checkpoints, please check the shape and if it is contiguous.");
 
-    TORCH_CHECK(ttt_norm_weight.device().is_cuda() && ttt_norm_weight.is_contiguous() && ttt_norm_weight.dim() == 4 && ttt_norm_weight.size(0) == 1 && ttt_norm_weight.size(1) == H && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(3) == F, "Invalid dims for ttt_norm_weight");
+        TORCH_CHECK(ttt_norm_weight.device().is_cuda() && ttt_norm_weight.is_contiguous() && ttt_norm_weight.dim() == 4 && ttt_norm_weight.size(0) == 1 && ttt_norm_weight.size(1) == H && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(3) == F, "Encountered error with ttt_norm_weight, please check the shape and if it is contiguous.");
+
+        TORCH_CHECK(last_eta.device().is_cuda() && last_eta.is_contiguous() &&
+                last_eta.dim() == 5 && last_eta.size(4) == 1,
+                "Encountered error with last_eta, please check the shape and if it is contiguous.");
+
+        // Check ttt_norm_bias: expecting a 4-D tensor with shape [1, H, 1, F]
+        TORCH_CHECK(ttt_norm_bias.device().is_cuda() && ttt_norm_bias.is_contiguous() &&
+                    ttt_norm_bias.dim() == 4 && ttt_norm_bias.size(0) == 1 &&
+                    ttt_norm_bias.size(1) == H && ttt_norm_bias.size(2) == 1 &&
+                    ttt_norm_bias.size(3) == F,
+                    "Encountered error with ttt_norm_bias, please check the shape and if it is contiguous.");
+
+        // Check b1_checkpoints: expecting a 5-D tensor with shape [B, NH, K, 1, F*4]
+        TORCH_CHECK(b1_checkpoints.device().is_cuda() && b1_checkpoints.is_contiguous() &&
+                    b1_checkpoints.dim() == 5 && b1_checkpoints.size(0) == B &&
+                    b1_checkpoints.size(1) == NH && b1_checkpoints.size(2) == num_checkpoints &&
+                    b1_checkpoints.size(3) == 1 && b1_checkpoints.size(4) == F * 4,
+                    "Encountered error with b1_checkpoints, please check the shape and if it is contiguous.");
+
+        // Check b2_checkpoints: expecting a 5-D tensor with shape [B, NH, num_checkpoints, 1, F]
+        TORCH_CHECK(b2_checkpoints.device().is_cuda() && b2_checkpoints.is_contiguous() &&
+                    b2_checkpoints.dim() == 5 && b2_checkpoints.size(0) == B &&
+                    b2_checkpoints.size(1) == NH && b2_checkpoints.size(2) == num_checkpoints &&
+                    b2_checkpoints.size(3) == 1 && b2_checkpoints.size(4) == F,
+                    "Encountered error with b2_checkpoints, please check the shape and if it is contiguous.");
+
+        // Check W1_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, F, F*4]
+        TORCH_CHECK(W1_init_group.device().is_cuda() && W1_init_group.is_contiguous() &&
+                    W1_init_group.dim() == 5 && W1_init_group.size(0) == B &&
+                    W1_init_group.size(1) == NH && W1_init_group.size(2) == checkpoint_group_size &&
+                    W1_init_group.size(3) == F && W1_init_group.size(4) == F * 4,
+                    "Encountered error with W1_init_group, please check the shape and if it is contiguous.");
+
+        // Check b1_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, 1, F*4]
+        TORCH_CHECK(b1_init_group.device().is_cuda() && b1_init_group.is_contiguous() &&
+                    b1_init_group.dim() == 5 && b1_init_group.size(0) == B &&
+                    b1_init_group.size(1) == NH && b1_init_group.size(2) == checkpoint_group_size &&
+                    b1_init_group.size(3) == 1 && b1_init_group.size(4) == F * 4,
+                    "Encountered error with b1_init_group, please check the shape and if it is contiguous.");
+
+        // Check W2_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, F*4, F]
+        TORCH_CHECK(W2_init_group.device().is_cuda() && W2_init_group.is_contiguous() &&
+                    W2_init_group.dim() == 5 && W2_init_group.size(0) == B &&
+                    W2_init_group.size(1) == NH && W2_init_group.size(2) == checkpoint_group_size &&
+                    W2_init_group.size(3) == F * 4 && W2_init_group.size(4) == F,
+                    "Encountered error with W2_init_group, please check the shape and if it is contiguous.");
+
+        // Check b2_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, 1, F]
+        TORCH_CHECK(b2_init_group.device().is_cuda() && b2_init_group.is_contiguous() &&
+                    b2_init_group.dim() == 5 && b2_init_group.size(0) == B &&
+                    b2_init_group.size(1) == NH && b2_init_group.size(2) == checkpoint_group_size &&
+                    b2_init_group.size(3) == 1 && b2_init_group.size(4) == F,
+                    "Encountered error with b2_init_group, please check the shape and if it is contiguous.");
+
+        // Check x_hat_ln_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(x_hat_ln_group.device().is_cuda() && x_hat_ln_group.is_contiguous() &&
+                    x_hat_ln_group.dim() == 5 && x_hat_ln_group.size(0) == B &&
+                    x_hat_ln_group.size(1) == NH && x_hat_ln_group.size(2) == checkpoint_group_size &&
+                    x_hat_ln_group.size(3) == CS && x_hat_ln_group.size(4) == F,
+                    "Encountered error with x_hat_ln_group, please check the shape and if it is contiguous.");
+
+        // Check std_ln_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, 1]
+        TORCH_CHECK(std_ln_group.device().is_cuda() && std_ln_group.is_contiguous() &&
+                    std_ln_group.dim() == 5 && std_ln_group.size(0) == B &&
+                    std_ln_group.size(1) == NH && std_ln_group.size(2) == checkpoint_group_size &&
+                    std_ln_group.size(3) == CS && std_ln_group.size(4) == 1,
+                    "Encountered error with std_ln_group, please check the shape and if it is contiguous.");
+
+        // Check X2_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(X2_group.device().is_cuda() && X2_group.is_contiguous() &&
+                    X2_group.dim() == 5 && X2_group.size(0) == B &&
+                    X2_group.size(1) == NH && X2_group.size(2) == checkpoint_group_size &&
+                    X2_group.size(3) == CS && X2_group.size(4) == F * 4,
+                    "Encountered error with X2_group, please check the shape and if it is contiguous.");
+
+        // Check Z1_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(Z1_group.device().is_cuda() && Z1_group.is_contiguous() &&
+                    Z1_group.dim() == 5 && Z1_group.size(0) == B &&
+                    Z1_group.size(1) == NH && Z1_group.size(2) == checkpoint_group_size &&
+                    Z1_group.size(3) == CS && Z1_group.size(4) == F * 4,
+                    "Encountered error with Z1_group, please check the shape and if it is contiguous.");
+
+        // Check Z1_bar_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(Z1_bar_group.device().is_cuda() && Z1_bar_group.is_contiguous() &&
+                    Z1_bar_group.dim() == 5 && Z1_bar_group.size(0) == B &&
+                    Z1_bar_group.size(1) == NH && Z1_bar_group.size(2) == checkpoint_group_size &&
+                    Z1_bar_group.size(3) == CS && Z1_bar_group.size(4) == F * 4,
+                    "Encountered error with Z1_bar_group, please check the shape and if it is contiguous.");
+
+        // Check X2_bar_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(X2_bar_group.device().is_cuda() && X2_bar_group.is_contiguous() &&
+                    X2_bar_group.dim() == 5 && X2_bar_group.size(0) == B &&
+                    X2_bar_group.size(1) == NH && X2_bar_group.size(2) == checkpoint_group_size &&
+                    X2_bar_group.size(3) == CS && X2_bar_group.size(4) == F * 4,
+                    "Encountered error with X2_bar_group, please check the shape and if it is contiguous.");
+
+        // Check grad_l_wrt_Z2_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(grad_l_wrt_Z2_group.device().is_cuda() && grad_l_wrt_Z2_group.is_contiguous() &&
+                    grad_l_wrt_Z2_group.dim() == 5 && grad_l_wrt_Z2_group.size(0) == B &&
+                    grad_l_wrt_Z2_group.size(1) == NH && grad_l_wrt_Z2_group.size(2) == checkpoint_group_size &&
+                    grad_l_wrt_Z2_group.size(3) == CS && grad_l_wrt_Z2_group.size(4) == F,
+                    "Encountered error with grad_l_wrt_Z2_group, please check the shape and if it is contiguous.");
+
+        // Check grad_l_wrt_Z1_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(grad_l_wrt_Z1_group.device().is_cuda() && grad_l_wrt_Z1_group.is_contiguous() &&
+                    grad_l_wrt_Z1_group.dim() == 5 && grad_l_wrt_Z1_group.size(0) == B &&
+                    grad_l_wrt_Z1_group.size(1) == NH && grad_l_wrt_Z1_group.size(2) == checkpoint_group_size &&
+                    grad_l_wrt_Z1_group.size(3) == CS && grad_l_wrt_Z1_group.size(4) == F * 4,
+                    "Encountered error with grad_l_wrt_Z1_group, please check the shape and if it is contiguous.");
+
+        // Check x_hat_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(x_hat_fused_group.device().is_cuda() && x_hat_fused_group.is_contiguous() &&
+                    x_hat_fused_group.dim() == 5 && x_hat_fused_group.size(0) == B &&
+                    x_hat_fused_group.size(1) == NH && x_hat_fused_group.size(2) == checkpoint_group_size &&
+                    x_hat_fused_group.size(3) == CS && x_hat_fused_group.size(4) == F,
+                    "Encountered error with x_hat_fused_group, please check the shape and if it is contiguous.");
+
+        // Check grad_x_hat_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(grad_x_hat_fused_group.device().is_cuda() && grad_x_hat_fused_group.is_contiguous() &&
+                    grad_x_hat_fused_group.dim() == 5 && grad_x_hat_fused_group.size(0) == B &&
+                    grad_x_hat_fused_group.size(1) == NH && grad_x_hat_fused_group.size(2) == checkpoint_group_size &&
+                    grad_x_hat_fused_group.size(3) == CS && grad_x_hat_fused_group.size(4) == F,
+                    "Encountered error with grad_x_hat_fused_group, please check the shape and if it is contiguous.");
+
+        // Check grad_output_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(grad_output_fused_group.device().is_cuda() && grad_output_fused_group.is_contiguous() &&
+                    grad_output_fused_group.dim() == 5 && grad_output_fused_group.size(0) == B &&
+                    grad_output_fused_group.size(1) == NH && grad_output_fused_group.size(2) == checkpoint_group_size &&
+                    grad_output_fused_group.size(3) == CS && grad_output_fused_group.size(4) == F,
+                    "Encountered error with grad_output_fused_group, please check the shape and if it is contiguous.");
+
+        // Check std_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, 1]
+        TORCH_CHECK(std_fused_group.device().is_cuda() && std_fused_group.is_contiguous() &&
+                    std_fused_group.dim() == 5 && std_fused_group.size(0) == B &&
+                    std_fused_group.size(1) == NH && std_fused_group.size(2) == checkpoint_group_size &&
+                    std_fused_group.size(3) == CS && std_fused_group.size(4) == 1,
+                    "Encountered error with std_fused_group, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W1_last: expecting a 4-D tensor with shape [B, NH, F, F*4]
+        TORCH_CHECK(grad_L_W1_last.device().is_cuda() && grad_L_W1_last.is_contiguous() &&
+                    grad_L_W1_last.dim() == 4 && grad_L_W1_last.size(0) == B &&
+                    grad_L_W1_last.size(1) == NH && grad_L_W1_last.size(2) == F &&
+                    grad_L_W1_last.size(3) == F * 4,
+                    "Encountered error with grad_L_W1_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b1_last: expecting a 4-D tensor with shape [B, NH, 1, F*4]
+        TORCH_CHECK(grad_L_b1_last.device().is_cuda() && grad_L_b1_last.is_contiguous() &&
+                    grad_L_b1_last.dim() == 4 && grad_L_b1_last.size(0) == B &&
+                    grad_L_b1_last.size(1) == NH && grad_L_b1_last.size(2) == 1 &&
+                    grad_L_b1_last.size(3) == F * 4,
+                    "Encountered error with grad_L_b1_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W2_last: expecting a 4-D tensor with shape [B, NH, F*4, F]
+        TORCH_CHECK(grad_L_W2_last.device().is_cuda() && grad_L_W2_last.is_contiguous() &&
+                    grad_L_W2_last.dim() == 4 && grad_L_W2_last.size(0) == B &&
+                    grad_L_W2_last.size(1) == NH && grad_L_W2_last.size(2) == F * 4 &&
+                    grad_L_W2_last.size(3) == F,
+                    "Encountered error with grad_L_W2_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b2_last: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_b2_last.device().is_cuda() && grad_L_b2_last.is_contiguous() &&
+                    grad_L_b2_last.dim() == 4 && grad_L_b2_last.size(0) == B &&
+                    grad_L_b2_last.size(1) == NH && grad_L_b2_last.size(2) == 1 &&
+                    grad_L_b2_last.size(3) == F,
+                    "Encountered error with grad_L_b2_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XQW_mini_batch: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XQW_mini_batch.device().is_cuda() && grad_L_XQW_mini_batch.is_contiguous() &&
+                    grad_L_XQW_mini_batch.dim() == 5 && grad_L_XQW_mini_batch.size(0) == B &&
+                    grad_L_XQW_mini_batch.size(1) == NH && grad_L_XQW_mini_batch.size(2) == NC &&
+                    grad_L_XQW_mini_batch.size(3) == CS && grad_L_XQW_mini_batch.size(4) == F,
+                    "Encountered error with grad_L_XQW_mini_batch, please check the shape and if it is contiguous.");
+
+        // Check grad_L_ttt_norm_weight: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_ttt_norm_weight.device().is_cuda() && grad_L_ttt_norm_weight.is_contiguous() &&
+                    grad_L_ttt_norm_weight.dim() == 4 && grad_L_ttt_norm_weight.size(0) == B &&
+                    grad_L_ttt_norm_weight.size(1) == NH && grad_L_ttt_norm_weight.size(2) == 1 &&
+                    grad_L_ttt_norm_weight.size(3) == F,
+                    "Encountered error with grad_L_ttt_norm_weight, please check the shape and if it is contiguous.");
+
+        // Check grad_L_ttt_norm_bias: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_ttt_norm_bias.device().is_cuda() && grad_L_ttt_norm_bias.is_contiguous() &&
+                    grad_L_ttt_norm_bias.dim() == 4 && grad_L_ttt_norm_bias.size(0) == B &&
+                    grad_L_ttt_norm_bias.size(1) == NH && grad_L_ttt_norm_bias.size(2) == 1 &&
+                    grad_L_ttt_norm_bias.size(3) == F,
+                    "Encountered error with grad_L_ttt_norm_bias, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W1_init: expecting a 4-D tensor with shape [B, NH, F, F*4]
+        TORCH_CHECK(grad_L_W1_init.device().is_cuda() && grad_L_W1_init.is_contiguous() &&
+                    grad_L_W1_init.dim() == 4 && grad_L_W1_init.size(0) == B &&
+                    grad_L_W1_init.size(1) == NH && grad_L_W1_init.size(2) == F &&
+                    grad_L_W1_init.size(3) == F * 4,
+                    "Encountered error with grad_L_W1_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b1_init: expecting a 4-D tensor with shape [B, NH, 1, F*4]
+        TORCH_CHECK(grad_L_b1_init.device().is_cuda() && grad_L_b1_init.is_contiguous() &&
+                    grad_L_b1_init.dim() == 4 && grad_L_b1_init.size(0) == B &&
+                    grad_L_b1_init.size(1) == NH && grad_L_b1_init.size(2) == 1 &&
+                    grad_L_b1_init.size(3) == F * 4,
+                    "Encountered error with grad_L_b1_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W2_init: expecting a 4-D tensor with shape [B, NH, F*4, F]
+        TORCH_CHECK(grad_L_W2_init.device().is_cuda() && grad_L_W2_init.is_contiguous() &&
+                    grad_L_W2_init.dim() == 4 && grad_L_W2_init.size(0) == B &&
+                    grad_L_W2_init.size(1) == NH && grad_L_W2_init.size(2) == F * 4 &&
+                    grad_L_W2_init.size(3) == F,
+                    "Encountered error with grad_L_W2_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b2_init: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_b2_init.device().is_cuda() && grad_L_b2_init.is_contiguous() &&
+                    grad_L_b2_init.dim() == 4 && grad_L_b2_init.size(0) == B &&
+                    grad_L_b2_init.size(1) == NH && grad_L_b2_init.size(2) == 1 &&
+                    grad_L_b2_init.size(3) == F,
+                    "Encountered error with grad_L_b2_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_last_eta: expecting a 5-D tensor with shape [B, NH, NC, CS, 1]
+        TORCH_CHECK(grad_L_last_eta.device().is_cuda() && grad_L_last_eta.is_contiguous() &&
+                    grad_L_last_eta.dim() == 5 && grad_L_last_eta.size(0) == B &&
+                    grad_L_last_eta.size(1) == NH && grad_L_last_eta.size(2) == NC &&
+                    grad_L_last_eta.size(3) == CS && grad_L_last_eta.size(4) == 1,
+                    "Encountered error with grad_L_last_eta, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XQ: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XQ.device().is_cuda() && grad_L_XQ.is_contiguous() &&
+                    grad_L_XQ.dim() == 5 && grad_L_XQ.size(0) == B &&
+                    grad_L_XQ.size(1) == NH && grad_L_XQ.size(2) == NC &&
+                    grad_L_XQ.size(3) == CS && grad_L_XQ.size(4) == F,
+                    "Encountered error with grad_L_XQ, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XK: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XK.device().is_cuda() && grad_L_XK.is_contiguous() &&
+                    grad_L_XK.dim() == 5 && grad_L_XK.size(0) == B &&
+                    grad_L_XK.size(1) == NH && grad_L_XK.size(2) == NC &&
+                    grad_L_XK.size(3) == CS && grad_L_XK.size(4) == F,
+                    "Encountered error with grad_L_XK, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XV: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XV.device().is_cuda() && grad_L_XV.is_contiguous() &&
+                    grad_L_XV.dim() == 5 && grad_L_XV.size(0) == B &&
+                    grad_L_XV.size(1) == NH && grad_L_XV.size(2) == NC &&
+                    grad_L_XV.size(3) == CS && grad_L_XV.size(4) == F,
+                    "Encountered error with grad_L_XV, please check the shape and if it is contiguous.");
+        
+        checks_done = true;
+    }
+
 
     using globals = bwd_globals<F>;
 
