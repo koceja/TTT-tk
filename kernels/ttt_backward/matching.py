@@ -4,22 +4,6 @@ import multiprocessing
 import time
 import math
 
-from kernels.ttt_backward.triton_comps.linear_backward import ttt_linear_scan_backward
-
-from kernels.ttt_backward.triton_comps.mlp_backward_split import (
-    ttt_mlp_stage_1,
-    ttt_mlp_stage_2,
-    ttt_mlp_stage_3,
-    ttt_mlp_backward_stage_1,
-    ttt_mlp_backward_stage_2,
-    ttt_mlp_backward_stage_3,
-    ttt_mlp_backward_stage_4,
-    ttt_mlp_backward_stage_5,
-    ttt_mlp_backward_stage_6,
-    ttt_mlp_backward_stage_7,
-    ttt_mlp_backward_stage_8,
-)
-
 from tabulate import tabulate
 
 def compare_all_grads(gradients_to_compare):
@@ -115,7 +99,7 @@ def compute_mini_batch_no_dual(
 
     # Stage 2: LnFusedL2BWD
 
-    eps = 1e-6
+    eps = 1e-8
     mu_fused = Z2.mean(dim=-1, keepdim=True)
     var_fused = Z2.var(dim=-1, keepdim=True, unbiased=False)
 
@@ -166,7 +150,6 @@ def compute_mini_batch_no_dual(
     XQW_mini_batch = xq_mb + Z2_bar_ln
 
     return (
-        XQW_mini_batch, 
         W1_next, 
         b1_next, 
         W2_next, 
@@ -185,81 +168,6 @@ def compute_mini_batch_no_dual(
         # LN
         std_ln,
         x_hat_ln,
-        Z2
-    )
-
-def get_backward_inputs(B, NH, NC, CS, F, seed=0):
-    torch.manual_seed(seed)
-
-    XQ_batch = torch.randn(B, NH, NC, CS, F, device="cuda")
-    XK_batch = torch.randn(B, NH, NC, CS, F, device="cuda")
-    Z1 = torch.randn(B, NH, NC, CS, F * 4, device="cuda")
-
-    W1_init = torch.randn(B, NH, F, F * 4, device="cuda")
-    b1_init = torch.randn(B, NH, 1, F * 4, device="cuda")
-    W2_init = torch.randn(B, NH, F * 4, F, device="cuda")
-    b2_init = torch.randn(B, NH, 1, F, device="cuda")
-    
-    ttt_norm_weight = torch.randn(NH, F, device="cuda")
-    ttt_norm_bias = torch.randn(NH, F, device="cuda")
-    
-    std_fused = torch.randn(B, NH, NC, CS, 1, device="cuda")
-    x_hat_fused = torch.randn(B, NH, NC, CS, F, device="cuda")
-    grad_output_fused = torch.randn(B, NH, NC, CS, F, device="cuda")
-    grad_x_hat_fused = torch.randn(B, NH, NC, CS, F, device="cuda")
-    grad_l_wrt_Z2 = torch.randn(B, NH, NC, CS, F, device="cuda")
-    grad_l_wrt_Z1 = torch.randn(B, NH, NC, CS, F * 4, device="cuda")
-    
-    eta_batch = torch.randn(B, NH, NC, CS, CS, device="cuda")
-    Attn1 = torch.randn(B, NH, NC, CS, CS, device="cuda")
-    Attn2 = torch.randn(B, NH, NC, CS, CS, device="cuda")
-    X2 = torch.randn(B, NH, NC, CS, F * 4, device="cuda")
-    Z1_bar = torch.randn(B, NH, NC, CS, F * 4, device="cuda")
-    X2_bar = torch.randn(B, NH, NC, CS, F * 4, device="cuda")
-    Z2_bar = torch.randn(B, NH, NC, CS, F * 4, device="cuda")
-    
-    std_ln = torch.randn(B, NH, NC, CS, 1, device="cuda")
-    x_hat_ln = torch.randn(B, NH, NC, CS, F, device="cuda")
-
-    grad_L_W1_last = torch.randn(B, NH, F, F * 4, device="cuda")
-    grad_L_b1_last = torch.randn(B, NH, 1, F * 4, device="cuda")
-    grad_L_W2_last = torch.randn(B, NH, F * 4, F, device="cuda")
-    grad_L_b2_last = torch.randn(B, NH, 1, F, device="cuda")
-    grad_L_XQW_batch = torch.randn(B, NH, NC, CS, F, device="cuda")
-
-    return (
-        XQ_batch,
-        XK_batch,
-        Z1,
-        W1_init,
-        b1_init,
-        W2_init,
-        b2_init,
-        # LnFusedL2BWD
-        ttt_norm_weight,
-        ttt_norm_bias,
-        std_fused,
-        x_hat_fused,
-        grad_output_fused,
-        grad_x_hat_fused,
-        grad_l_wrt_Z2,
-        grad_l_wrt_Z1,
-        # Dual Form
-        eta_batch,
-        Attn1,
-        Attn2,
-        X2,
-        Z1_bar,
-        X2_bar,
-        Z2_bar,
-        # LN
-        std_ln,
-        x_hat_ln,
-        grad_L_W1_last,
-        grad_L_b1_last,
-        grad_L_W2_last,
-        grad_L_b2_last,
-        grad_L_XQW_batch,
     )
 
 def backward(
@@ -316,9 +224,7 @@ def backward(
         / std_ln
     )
 
-
-    # Stage 3: Dual Form
-    
+    # Stage 3: Update
     last_eta_mini_batch = eta_mini_batch[:, :, -1, :, None]
 
     grad_L_X2_bar = grad_L_Z2_bar @ W2_last.transpose(-2, -1)
@@ -371,7 +277,6 @@ def backward(
     )
 
     grad_L_y = ln_weight * grad_L_grad_x_hat_fused
-    # breakpoint()
 
     grad_L_ln_weight_fused = (
         (grad_output_fused * grad_L_grad_x_hat_fused + grad_L_y * x_hat_fused).sum(dim=-2, keepdim=True).sum(dim=0)
@@ -433,21 +338,20 @@ def backward(
         grad_L_XQ,
         grad_L_XV,
         grad_L_XK,
-        grad_L_eta,
-        grad_L_Z2
+        grad_L_eta
     )
 
 def main():
     torch.manual_seed(0)
     # Define shapes
     B = 1
-    NH = 12
+    NH = 48
     
-    seq_len = 150144
+    seq_len = 2048
     mini_batch_size = 64
     CS = mini_batch_size
     NC = seq_len // mini_batch_size
-    checkpoint_group_size = 6
+    checkpoint_group_size = 4
     K = math.ceil(NC / checkpoint_group_size)
 
     head_dim = 64
@@ -458,19 +362,18 @@ def main():
     dtype = torch.bfloat16
     full_dtype = torch.float32
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # device = 'cpu'
 
     def get_inputs(dtype):
         torch.manual_seed(0)
         # Create inputs
-        xq = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-        xk = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
-        xv = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xq = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xk = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
+        xv = torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
-        eta = torch.ones(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).contiguous() * 0.02
+        eta = torch.randn(B, NH, NC, mini_batch_size, mini_batch_size, dtype=dtype, device=device).abs().contiguous() * 0.02
         last_eta = eta[:, :, :, -1, :, None].contiguous()
 
-        ttt_norm_weight = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
+        ttt_norm_weight = torch.ones(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous()
         ttt_norm_bias = torch.randn(1, NH, 1, head_dim, dtype=dtype, device=device).contiguous() * 0.02
 
         W1 = torch.randn(B, NH, head_dim, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
@@ -487,10 +390,10 @@ def main():
     XV_batch = XV_batch.to(torch.bfloat16).contiguous()
     last_eta = last_eta.to(torch.bfloat16).contiguous()
 
-    W1_checkpoints = torch.ones(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
-    b1_checkpoints = torch.ones(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
-    W2_checkpoints = torch.ones(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
-    b2_checkpoints = torch.ones(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W1_checkpoints = torch.randn(B, NH, K, head_dim, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b1_checkpoints = torch.randn(B, NH, K, 1, expansion_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    W2_checkpoints = torch.randn(B, NH, K, expansion_dim, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
+    b2_checkpoints = torch.randn(B, NH, K, 1, head_dim, dtype=full_dtype, device=device).contiguous() * 0.02
     output_tk = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
     output_ref = torch.zeros(B, NH, NC, mini_batch_size, head_dim, dtype=dtype, device=device).contiguous()
 
@@ -498,7 +401,7 @@ def main():
     grad_L_b1_last = torch.zeros(B, NH, 1, expansion_dim, dtype=torch.float32, device=device).contiguous() * 0.02
     grad_L_W2_last = torch.zeros(B, NH, expansion_dim, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
     grad_L_b2_last = torch.zeros(B, NH, 1, head_dim, dtype=torch.float32, device=device).contiguous() * 0.02
-    grad_L_XQW_mini_batch = (torch.ones(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device)).contiguous()
+    grad_L_XQW_mini_batch = torch.randn(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
 
     grad_L_ttt_norm_weight = torch.zeros(B, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
     grad_L_ttt_norm_bias = torch.zeros(B, NH, 1, head_dim, dtype=full_dtype, device=device).contiguous()
@@ -564,117 +467,60 @@ def main():
     grad_L_XV_ref = torch.empty(B, NH, NC, mini_batch_size, head_dim, dtype=torch.bfloat16, device=device).contiguous()
     grad_L_eta_ref = torch.empty_like(eta_batch).contiguous()
 
-    # Start
-    inputs = torch.load('/home/yusu/new_home/code/kd/ttt-video/rank4_saved_tensors.pth', map_location=torch.device('cpu'))
-
-    XQ_batch = inputs['XQ_batch'].cuda()
-    XK_batch = inputs['XK_batch'].cuda()
-    XV_batch = inputs['XV_batch'].cuda()
-    last_eta = inputs['last_eta'].cuda()
-    ttt_norm_weight = inputs['ttt_norm_weight'].cuda()
-    ttt_norm_bias = inputs['ttt_norm_bias'].cuda()
-    W1_checkpoints = inputs['W1_checkpoints'].cuda()
-    b1_checkpoints = inputs['b1_checkpoints'].cuda()
-    W2_checkpoints = inputs['W2_checkpoints'].cuda()
-    b2_checkpoints = inputs['b2_checkpoints'].cuda()
-    grad_L_XQW_mini_batch = inputs['grad_L_XQW_batch'].cuda()
-
     # Call TK
-    for i in range(100):
-        grad_L_ttt_norm_weight = torch.zeros_like(grad_L_ttt_norm_weight) 
-        grad_L_ttt_norm_bias = torch.zeros_like(grad_L_ttt_norm_bias) 
-        grad_L_W1_init = torch.zeros_like(grad_L_W1_init) 
-        grad_L_b1_init = torch.zeros_like(grad_L_b1_init) 
-        grad_L_W2_init = torch.zeros_like(grad_L_W2_init) 
-        grad_L_b2_init = torch.zeros_like(grad_L_b2_init) 
-        grad_L_last_eta = torch.zeros_like(grad_L_last_eta) 
-        grad_L_XQ = torch.zeros_like(grad_L_XQ) 
-        grad_L_XK = torch.zeros_like(grad_L_XK) 
-        grad_L_XV = torch.zeros_like(grad_L_XV)
-        output_tk = torch.zeros_like(output_tk)
+    test_time_training.ttt_backward(
+        # Inputs
+        XQ_batch.contiguous(),
+        XK_batch.contiguous(),
+        XV_batch.contiguous(),
+        last_eta.contiguous(),
+        ttt_norm_weight.contiguous(),
+        ttt_norm_bias.contiguous(),
+        # Checkpoints
+        W1_checkpoints.contiguous(),
+        b1_checkpoints.contiguous(),
+        W2_checkpoints.contiguous(),
+        b2_checkpoints.contiguous(),
+        output_tk.contiguous(),
+        # Rematted Buffers
+        W1_init_group.contiguous(),
+        b1_init_group.contiguous(),
+        W2_init_group.contiguous(),
+        b2_init_group.contiguous(),
+        x_hat_ln_group.contiguous(),
+        std_ln_group.contiguous(),
+        X2_group.contiguous(),
+        Z1_group.contiguous(),
+        Z1_bar_group.contiguous(),
+        X2_bar_group.contiguous(),
+        grad_l_wrt_Z2_group.contiguous(),
+        grad_l_wrt_Z1_group.contiguous(),
+        x_hat_fused_group.contiguous(),
+        grad_x_hat_fused_group.contiguous(),
+        grad_output_fused_group.contiguous(),
+        std_fused_group.contiguous(),
+        # Upstream grads
+        grad_L_W1_last.contiguous(),
+        grad_L_b1_last.contiguous(),
+        grad_L_W2_last.contiguous(),
+        grad_L_b2_last.contiguous(),
+        grad_L_XQW_mini_batch.contiguous(),
+        # Output grads
+        grad_L_ttt_norm_weight.contiguous(),
+        grad_L_ttt_norm_bias.contiguous(),
+        grad_L_W1_init.contiguous(),
+        grad_L_b1_init.contiguous(),
+        grad_L_W2_init.contiguous(),
+        grad_L_b2_init.contiguous(),
+        grad_L_last_eta.contiguous(),
+        grad_L_XQ.contiguous(),
+        grad_L_XK.contiguous(),
+        grad_L_XV.contiguous(),
+        checkpoint_group_size
+    )
 
-        test_time_training.ttt_backward(
-            # Inputs
-            XQ_batch.contiguous(),
-            XK_batch.contiguous(),
-            XV_batch.contiguous(),
-            last_eta.contiguous(),
-            ttt_norm_weight.contiguous(),
-            ttt_norm_bias.contiguous(),
-            # Checkpoints
-            W1_checkpoints.contiguous(),
-            b1_checkpoints.contiguous(),
-            W2_checkpoints.contiguous(),
-            b2_checkpoints.contiguous(),
-            output_tk.contiguous(),
-            # Rematted Buffers
-            W1_init_group.contiguous(),
-            b1_init_group.contiguous(),
-            W2_init_group.contiguous(),
-            b2_init_group.contiguous(),
-            x_hat_ln_group.contiguous(),
-            std_ln_group.contiguous(),
-            X2_group.contiguous(),
-            Z1_group.contiguous(),
-            Z1_bar_group.contiguous(),
-            X2_bar_group.contiguous(),
-            grad_l_wrt_Z2_group.contiguous(),
-            grad_l_wrt_Z1_group.contiguous(),
-            x_hat_fused_group.contiguous(),
-            grad_x_hat_fused_group.contiguous(),
-            grad_output_fused_group.contiguous(),
-            std_fused_group.contiguous(),
-            # Upstream grads
-            grad_L_W1_last.contiguous(),
-            grad_L_b1_last.contiguous(),
-            grad_L_W2_last.contiguous(),
-            grad_L_b2_last.contiguous(),
-            grad_L_XQW_mini_batch.contiguous(),
-            # Output grads
-            grad_L_ttt_norm_weight.contiguous(),
-            grad_L_ttt_norm_bias.contiguous(),
-            grad_L_W1_init.contiguous(),
-            grad_L_b1_init.contiguous(),
-            grad_L_W2_init.contiguous(),
-            grad_L_b2_init.contiguous(),
-            grad_L_last_eta.contiguous(),
-            grad_L_XQ.contiguous(),
-            grad_L_XK.contiguous(),
-            grad_L_XV.contiguous(),
-            checkpoint_group_size
-        )
-
-
-        print(i)
-
-        print(grad_L_ttt_norm_weight.shape)
-        print(grad_L_ttt_norm_bias.shape)
-
-        grad_L_ttt_norm_weight = grad_L_ttt_norm_weight.sum(dim=0).unsqueeze(0)
-        grad_L_ttt_norm_bias = grad_L_ttt_norm_bias.sum(dim=0).unsqueeze(0)
-
-        tensors_to_check = {
-            "grad_L_ttt_norm_weight": grad_L_ttt_norm_weight,
-            "grad_L_ttt_norm_bias": grad_L_ttt_norm_bias,
-            "grad_L_W1_init": grad_L_W1_init,
-            "grad_L_b1_init": grad_L_b1_init,
-            "grad_L_W2_init": grad_L_W2_init,
-            "grad_L_b2_init": grad_L_b2_init,
-            "grad_L_last_eta": grad_L_last_eta,
-            "grad_L_XQ": grad_L_XQ,
-            "grad_L_XK": grad_L_XK,
-            "grad_L_XV": grad_L_XV,
-        }
-
-        found_nan = False
-        for name, tensor in tensors_to_check.items():
-            if torch.isnan(tensor).any():
-                print(f"{name} contains NaN")
-                found_nan = True
-
-        if found_nan:
-            print("Hit NaN!")
-            break
+    grad_L_ttt_norm_weight = grad_L_ttt_norm_weight.sum(dim=0).unsqueeze(0)
+    grad_L_ttt_norm_bias = grad_L_ttt_norm_bias.sum(dim=0).unsqueeze(0)
         
     XQ_batch = XQ_batch.to(torch.float32) 
     XK_batch = XK_batch.to(torch.float32) 
@@ -687,7 +533,7 @@ def main():
     W2_checkpoints = W2_checkpoints.to(torch.float32) 
     b2_checkpoints = b2_checkpoints.to(torch.float32) 
     grad_L_XQW_mini_batch = grad_L_XQW_mini_batch.to(torch.float32)
-    eta_batch = last_eta.repeat(1, 1, 1, 1, 64)
+    eta_batch = eta_batch.to(torch.float32)
 
     # Call Torch
     with torch.no_grad():
@@ -716,7 +562,6 @@ def main():
                 b2_init_group_ref[:,:,i] = b2_curr
 
                 (
-                    output_ref[:, :, global_mini_batch_idx],
                     W1_curr,
                     b1_curr,
                     W2_curr,
@@ -735,7 +580,6 @@ def main():
                     # LN
                     std_ln_group_ref[:,:,i],
                     x_hat_ln_group_ref[:,:,i],
-                    _
                 ) = compute_mini_batch_no_dual(
                     W1_curr, 
                     b1_curr, 
@@ -748,8 +592,6 @@ def main():
                     ttt_norm_weight,
                     ttt_norm_bias
                 )
-
-                
 
             for i in range(checkpoint_group_size - 1, -1, -1):
                 global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + i
@@ -770,7 +612,6 @@ def main():
                     grad_L_XV_ref[:,:,global_mini_batch_idx],
                     grad_L_XK_ref[:,:,global_mini_batch_idx],
                     grad_L_eta_ref[:,:,global_mini_batch_idx],
-                    output_ref[:,:,global_mini_batch_idx]
                 ) = backward(
                     # MatMul
                     xq_mb,
@@ -857,105 +698,12 @@ def main():
         (grad_L_ttt_norm_weight, grad_L_ttt_norm_weight_ref, 'grad_L_ttt_norm_weight'),
         (grad_L_ttt_norm_bias, grad_L_ttt_norm_bias_ref, 'grad_L_ttt_norm_bias'),
         (grad_L_eta, grad_L_eta_ref, 'grad_L_eta'),
-        (output_tk, output_ref, "Outputs")
+        (output_tk, output_ref, "debug_output")
     ]
 
     # Execute the comparison
     compare_all_grads(gradients_to_compare)
 
-    tensors_to_check = {
-        "grad_L_ttt_norm_weight": grad_L_ttt_norm_weight_ref,
-        "grad_L_ttt_norm_bias": grad_L_ttt_norm_bias_ref,
-        "grad_L_W1_init": grad_L_W1_init_ref,
-        "grad_L_b1_init": grad_L_b1_init_ref,
-        "grad_L_W2_init": grad_L_W2_init_ref,
-        "grad_L_b2_init": grad_L_b2_init_ref,
-        "grad_L_eta": grad_L_eta_ref,
-        "grad_L_XQ": grad_L_XQ_ref,
-        "grad_L_XK": grad_L_XK_ref,
-        "grad_L_XV": grad_L_XV_ref,
-    }
-
-    found_nan = False
-    for name, tensor in tensors_to_check.items():
-        if torch.isnan(tensor).any():
-            print(f"{name} contains NaN")
-            found_nan = True
-
-    breakpoint()
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    # Flatten the Sequence
-    grad_L_XV_flat = grad_L_XV.reshape(1, 12, -1, 64)
-    grad_L_XV_ref_flat = grad_L_XV_ref.reshape(1, 12, -1, 64)
-
-    output_tk_flat = output_tk.reshape(1, 12, -1, 64)
-    output_ref_flat = output_ref.reshape(1, 12, -1, 64)
-
-    # Reverse tokens
-    grad_L_XV_flat_reversed = grad_L_XV_flat #.flip(dims=[2])
-    grad_L_XV_ref_flat_reversed = grad_L_XV_ref_flat #.flip(dims=[2])
-
-    output_tk_flat_reversed = output_tk_flat # .flip(dims=[2]) / 4
-    output_ref_flat_reversed = output_ref_flat #.flip(dims=[2]) / 4
-
-    # Calculate means across dimensions [0,1,3,4] for each batch position
-    means_hw = []
-    means_ref = []
-    means_output_tk = []
-    means_output_ref = []
-    num_tokens = grad_L_XV_flat_reversed.shape[2]
-
-    means_hw = [grad_L_XV_flat_reversed[:,:,i,:].mean().item() for i in range(num_tokens)]
-    means_ref = [grad_L_XV_ref_flat_reversed[:,:,i,:].mean().item() for i in range(num_tokens)]
-    means_output_tk = [output_tk_flat_reversed[:,:,i,:].mean().item() for i in range(num_tokens)]
-    means_output_ref = [output_ref_flat_reversed[:,:,i,:].mean().item() for i in range(num_tokens)]
-
-    # HANDLES THE PLOTTING CODE
-    diff_hw = np.abs(np.array(means_hw) - np.array(means_ref))
-    diff_out = np.abs(np.array(means_output_tk) - np.array(means_output_ref))
-
-    # 2. Define a threshold for “craziness”
-    threshold = 1e10  # adjust as appropriate
-
-    # 3. Find the first index where each difference exceeds the threshold
-    def find_first_crazy_index(diffs, thresh):
-        for i, val in enumerate(diffs):
-            if val > thresh:
-                return i
-        return None  # means no index exceeded the threshold
-
-    crazy_idx_hw = find_first_crazy_index(diff_hw, threshold)
-    crazy_idx_out = find_first_crazy_index(diff_out, threshold)
-
-    print("First crazy index (Hardware vs Reference):", crazy_idx_hw)
-    print("First crazy index (Output TK vs Ref):", crazy_idx_out)
-
-    # Create the plot
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), dpi=300)
-
-    # First subplot for Hardware Implementation
-    ax1.plot(means_hw, label='Hardware Implementation', alpha=0.7)
-    ax1.plot(means_ref, label='Reference Implementation', alpha=0.7)
-    ax1.set_xlabel('Reversed Batch Index')
-    ax1.set_ylabel('Mean Gradient Value')
-    ax1.set_title('Hardware vs Reference Implementation')
-    ax1.legend()
-    ax1.grid(True)
-
-    # Second subplot for Output
-    ax2.plot(means_output_tk, label='Output TK', alpha=0.7)
-    ax2.plot(means_output_ref, label='Output Ref', alpha=0.7)
-    ax2.set_xlabel('Reversed Batch Index')
-    ax2.set_ylabel('Mean Value')
-    ax2.set_title('Output TK vs Output Ref')
-    ax2.legend()
-    ax2.grid(True)
-
-    plt.tight_layout()
-    plt.savefig('gradient_comparison_grad_l_z2_bar.png', dpi=300)
-    plt.close()
 
 # Wrapper function to kill the process if it takes too long
 def kernel_with_timeout(kernel_function, timeout=10):

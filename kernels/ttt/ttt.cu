@@ -16,10 +16,8 @@ constexpr int NUM_WORKERS = (NUM_WARPGROUPS * kittens::WARPGROUP_WARPS);
 
 using namespace kittens;
 
-// template <int head_dim> struct fwd_ttt_mlp_ker_tile_dims {};
 template <int head_dim> struct fwd_ttt_mlp_ker_tile_dims {
     constexpr static int mini_batch_size = 64;
-    // constexpr static int tile_width = (16);
     constexpr static int F = head_dim;
     constexpr static int stages = (2);
 };
@@ -275,8 +273,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
         kittens::wait(ttt_norm_weight_arrived, 0);
         kittens::wait(ttt_norm_bias_arrived, 0);
 
-
-
         for (auto idx = 0; idx < n_minibatch; idx++) {
             // Save hidden state checkpoint (W1)
             if (wg_warpid == 0 && idx % checkpoint_group_size == 0) {
@@ -313,7 +309,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             add_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
             warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
             warpgroup::sync(warpgroupid+1);
-
             
             gelu(cs_cs_fl_reg, cs_cs_fl_reg);
             warpgroup::store(x2_smem[warpgroupid], cs_cs_fl_reg);
@@ -351,8 +346,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
 
                 tma::cluster::sync();
                 warpgroup::add(z2_smem[0], z2_smem[0], reduction_buffer);
-
-                
 
                 // mean
                 zero(cs_col_fl_reg);
@@ -422,14 +415,11 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
                 warpgroup::store(grad_l_z2_smem[curr_stage], cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::mul_row(grad_l_z2_smem[curr_stage], grad_l_z2_smem[curr_stage], last_eta_smem[idx % K::stages]);
-                // warpgroup::store(bf_tile_smem[idx % K::stages], cs_cs_fl_reg);
             }
             else {
                 tma::cluster::arrive_aligned();
                 tma::cluster::arrive_aligned();
             }
-
-            
 
             // Wait on each other to complete
             if (warpgroup::laneid() == 0) arrive(reduction_done, 1);
@@ -447,9 +437,8 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             warpgroup::load(cs_cs_fl_reg, z1_smem[warpgroupid]);
             gelu_bwd(cs_cs_fl_reg, cs_cs_fl_reg);
             warpgroup::store(z1_smem[warpgroupid], cs_cs_fl_reg);
-            warpgroup::sync(warpgroupid+1); // I dont think this one is necessary
+            warpgroup::sync(warpgroupid+1);
             warpgroup::mul(grad_l_z1_smem[warpgroupid], grad_l_z1_smem[warpgroupid], z1_smem[warpgroupid]);
-
             
             // Update W2
             warpgroup::load(cs_cs_fl_reg, w2_smem[warpgroupid]);
@@ -476,9 +465,7 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
             // Update b1
             warpgroup::copy(b_acc_smem[warpgroupid], grad_l_z1_smem[warpgroupid]);
             warpgroup::col_sum(b1_smem[warpgroupid], b_acc_smem[warpgroupid], b1_smem[warpgroupid]);
-
             warpgroup::sync(warpgroupid+1);
-            
 
             // Compute output
             zero(cs_cs_fl_reg);
@@ -518,8 +505,6 @@ void fwd_ttt_mlp_ker(const __grid_constant__ fwd_globals<head_dim> g) {
 
             if (warpgroup::laneid() == 0) arrive(second_start_reduction, 1);
             kittens::wait(second_start_reduction, idx % 2);
-
-            
 
             // Warpgroup 0 will perform reduction
             if (warpgroupid == 0) {
@@ -632,9 +617,6 @@ torch::Tensor ttt_forward(
     unsigned long NC = XQ.size(2);
     unsigned long CS = XQ.size(3);
     unsigned long num_checkpoints = static_cast<int>(W1_checkpoints.size(2));
-    // const int checkpoint_group_size = math.ceil(NC / num_checkpoints);
-
-    // TORCH_CHECK(NC % num_checkpoints == 0, "N % R == 0");
     
     TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 5 && XQ.size(4) == F, "Invalid dims for XQ");
     TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 5 && XK.size(4) == F, "Invalid dims for XK");

@@ -16,16 +16,6 @@ sources = {
             'h100': 'kernels/ttt_backward/ttt.cu'
         }
     },
-    'attn': {
-        'source_files': {
-            'h100': 'kernels/attn/h100/h100.cu' # define these source files for each GPU target desired.
-        }
-    },
-    'fused_layernorm': {
-        'source_files': {
-            'h100': 'kernels/layernorm/non_pc/layer_norm.cu'
-        }
-    }
 }
 
 ### WHICH KERNELS DO WE WANT TO BUILD?
@@ -46,9 +36,6 @@ os.environ["LIBTORCH_PATH"] = os.path.join(os.getcwd(), "libtorch")
 thunderkittens_root = os.getenv('THUNDERKITTENS_ROOT', os.path.abspath(os.path.join(os.getcwd(), '.')))
 python_include = subprocess.check_output(['python', '-c', "import sysconfig; print(sysconfig.get_path('include'))"]).decode().strip()
 torch_include = subprocess.check_output(['python', '-c', "import torch; from torch.utils.cpp_extension import include_paths; print(' '.join(['-I' + p for p in include_paths()]))"]).decode().strip()
-# print('Thunderkittens root:', thunderkittens_root)
-# print('Python include:', python_include)
-# print('Torch include directories:', torch_include)
 
 # CUDA flags
 cuda_flags = [
@@ -59,12 +46,12 @@ cuda_flags = [
     '--expt-relaxed-constexpr',
     '-forward-unknown-to-host-compiler',
     '--use_fast_math',
-    '-std=c++20',
+    '-std=c++20', # Important: Needs gcc 11+
     '-O3',
     '-Xnvlink=--verbose',
     '-Xptxas=--verbose',
     '-Xptxas=--warn-on-spills',
-    # '-G',
+    # '-G', # Use this for debugging
     '-diag-suppress=3189', # "module is parsed as an identifier rather than a keyword"
     f'-I{thunderkittens_root}/include',
     f'-I{thunderkittens_root}/prototype',
@@ -88,7 +75,7 @@ elif target == 'a100':
 else:
     raise ValueError(f'Target {target} not supported')
 
-source_files = ['thunderkittens.cpp']
+source_files = ['test_time_training.cpp']
 for k in kernels:
     if target not in sources[k]['source_files']:
         raise KeyError(f'Target {target} not found in source files for kernel {k}')
