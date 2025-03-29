@@ -8,14 +8,16 @@
 #define TK_COMPILE_TTT_BACKWARD
 #endif
 
+// Kernel config
 constexpr int TP = (4);
 constexpr int CONSUMER_WARPGROUPS = (1);
 constexpr int PRODUCER_WARPGROUPS = (1);
 constexpr int NUM_WARPGROUPS = (CONSUMER_WARPGROUPS + PRODUCER_WARPGROUPS);
 constexpr int NUM_WORKERS = (NUM_WARPGROUPS * kittens::WARPGROUP_WARPS);
 
-using namespace kittens; // dangerous
+using namespace kittens; // dangerous as thunderkittens could overload cuda terms
 
+// Reduce a tensor across cluster
 template<ducks::st::all T>
 __device__ static inline void tp_reduce(
     T &src, 
@@ -55,6 +57,7 @@ __device__ static inline void tp_reduce(
     warpgroup::sync(1);
 }
 
+// For producer to signal tp, not functional besides preventing deadlock
 __device__ static inline void tp_reduce_arrive()
 {
     static_assert(TP == 4, "Reduction is only implemented for tp=4.");
@@ -65,12 +68,14 @@ __device__ static inline void tp_reduce_arrive()
     tma::cluster::arrive_aligned();
 }
 
+// General TTT metadata
 template <int head_dim> struct bwd_ttt_mlp_ker_tile_dims {
     constexpr static int mini_batch_size = 64;
     constexpr static int F = head_dim;
     constexpr static int stages = (2);
 };
 
+// Globals with memory layout metadata
 template <int head_dim> struct bwd_globals {
     using tile_dims = bwd_ttt_mlp_ker_tile_dims<head_dim>;
     // Tiles
@@ -112,6 +117,8 @@ template <int head_dim> struct bwd_globals {
     qkvo_gl q;
     qkvo_gl k;
     qkvo_gl v;
+
+    // This is output, used for debugging. Not o projection.
     qkvo_gl o;
 
     last_eta_gl last_eta;
@@ -209,15 +216,13 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
     if (is_producer)
     {
-        warpgroup::decrease_registers<24>(); // producer doesnt need many registers due to tma
+        // I believe there is a restriction on this, the register count here is ignored somewhat
+        warpgroup::decrease_registers<24>(); // producer needs less registers due to tma
     }
     else
     {
         warpgroup::increase_registers<256>(); // consumer needs all of the registers
-        // I believe there is a restriction on this, the register count should be slightly lower than this
     }
-    
-
 
     // Shared memory for hidden states
     F_F_tile_acc_type(&w1_smem) = al.allocate<F_F_tile_acc_type>();
@@ -235,6 +240,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     F_vec_acc_type(&ttt_norm_weight_smem) = al.allocate<F_vec_acc_type>();
     F_vec_acc_type(&ttt_norm_bias_smem) = al.allocate<F_vec_acc_type>();
 
+    // Extra shared memory for intermediate computations
     CS_F_tile_type(&z1_smem) = al.allocate<CS_F_tile_type>();
     CS_F_tile_type(&x2_smem) = al.allocate<CS_F_tile_type>();
     CS_F_tile_type(&ln_tile_smem) = al.allocate<CS_F_tile_type>();
@@ -250,21 +256,17 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     F_vec_acc_type(&grad_L_b1_smem) = al.allocate<F_vec_acc_type>();
     F_F_tile_acc_type(&grad_L_W2_smem) = al.allocate<F_F_tile_acc_type>();
     F_vec_acc_type(&grad_L_b2_smem) = al.allocate<F_vec_acc_type>();
-
     CS_vec_type(&grad_L_last_eta_smem) = al.allocate<CS_vec_type>();
-
     F_vec_acc_type(&grad_L_ttt_norm_weight_smem) = al.allocate<F_vec_acc_type>();
     F_vec_acc_type(&grad_L_ttt_norm_bias_smem) = al.allocate<F_vec_acc_type>();
-
     CS_vec_acc_type(&std_ln_smem) = al.allocate<CS_vec_acc_type>();
     CS_vec_acc_type(&std_fused_smem) = al.allocate<CS_vec_acc_type>();
 
-
+    // Reinterpretations for intermediates
     auto(&bwd_q_smem) = q_smem[0];
     auto(&bwd_k_smem) = k_smem[0];
     auto(&bwd_last_eta_smem) = last_eta_smem[0];
     auto(&grad_L_XQW_mini_batch_smem) = v_smem[0];
-
     auto(&x_hat_ln_smem) = z1_smem;
     auto(&grad_L_Z2_bar_smem) = x2_smem;
     auto(&z1_bar_smem) = grad_l_z1_smem;
@@ -282,20 +284,15 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     auto(&grad_output_fused_smem) = cs_f_store2_smem;
     auto(&grad_L_x_hat_fused_smem) = q_smem[1];
     auto(&grad_x_hat_fused_smem) = grad_l_z1_smem;
-
     auto(&grad_L_Z2_smem) = k_smem[1];
     auto(&grad_L_Z1_smem) = v_smem[0];
     auto(&grad_L_XK_smem) = q_smem[1];
-
-    // Reinterpretations for intermediates
     auto(&reduction_buffer) = matmul_smem;
     auto(&z2_smem) = grad_l_z1_smem;
     auto(&grad_l_z2_smem) = v_smem[0];
 
 
     // Create locks to make sure reads aren't premature
-    // A lot of these arent needed, but they use so little of smem
-    // I didn't feel like removing the unused ones
     __shared__ kittens::semaphore 
         w1_arrived,
         w2_arrived,
@@ -337,23 +334,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         grad_output_fused_arrived,
         grad_x_hat_fused_arrived,
         grad_L_XQW_mini_batch_sem_freed,
-        bwd_q_sem_freed,
         x_hat_ln_freed,
         grad_L_Z2_bar_freed,
         z1_bar_freed,
-        grad_L_Z1_bar_freed,
-        x2_bar_freed,
-        grad_l_wrt_Z2_freed,
-        x2_bwd_freed,
-        grad_l_wrt_Z1_freed,
-        grad_L_grad_l_wrt_Z1_freed,
-        grad_L_grad_l_wrt_Z2_freed,
-        z1_bwd_freed,
-        x_hat_fused_freed,
-        grad_L_grad_x_hat_fused_freed,
         grad_L_reconstruction_target_freed,
-        grad_L_x_hat_fused_freed,
-        grad_x_hat_fused_freed,
         cs_f_store2_smem_freed,
         w1_remat_smem_arrived,
         b1_remat_smem_arrived,
@@ -382,31 +366,28 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
             init_semaphore(compute_done[i], CONSUMER_WARPGROUPS, 0);
         }
 
-
+        // Flow synchronization
         init_semaphore(forward_done, 0, 1);
         init_semaphore(backward_done, 0, 1);
         init_semaphore(bwd_compute_done, 0, 1);
 
+        // Upstream gradients
         init_semaphore(grad_L_W1_arrived, 0, 1);
         init_semaphore(grad_L_b1_arrived, 0, 1);
         init_semaphore(grad_L_W2_arrived, 0, 1);
         init_semaphore(grad_L_b2_arrived, 0, 1);
 
-
+        // Loading in pipelined inputs
         init_semaphore(old_weights_done, 0, 1);
         init_semaphore(grad_L_XQW_mini_batch_sem_arrived, 0, 1);
         init_semaphore(bwd_q_sem_arrived, 0, 1);
         init_semaphore(bwd_k_sem_arrived, 0, 1);
         init_semaphore(bwd_last_eta_sem_arrived, 0, 1);
-
         init_semaphore(x_hat_ln_arrived, 0, 1);
-
         init_semaphore(std_ln_arrived, 0, 1);
         init_semaphore(std_fused_arrived, 0, 1);
-        
         init_semaphore(z1_bar_group_arrived, 0, 1);
         init_semaphore(x2_bar_group_arrived, 0, 1);
-
         init_semaphore(grad_l_wrt_Z2_arrived, 0, 1);
         init_semaphore(x2_bwd_arrived, 0, 1);
         init_semaphore(grad_l_wrt_Z1_arrived, 0, 1);
@@ -415,31 +396,21 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         init_semaphore(grad_x_hat_fused_arrived, 0, 1);
         init_semaphore(grad_output_fused_arrived, 0, 1);
 
+        // For pipelining
         init_semaphore(grad_L_XQW_mini_batch_sem_freed, 0, 1);
-        init_semaphore(bwd_q_sem_freed, 0, 1);
         init_semaphore(x_hat_ln_freed, 0, 1);
         init_semaphore(grad_L_Z2_bar_freed, 0, 1);
         init_semaphore(z1_bar_freed, 0, 1);
-        init_semaphore(grad_L_Z1_bar_freed, 0, 1);
-        init_semaphore(x2_bar_freed, 0, 1);
-        init_semaphore(grad_l_wrt_Z2_freed, 0, 1);
-        init_semaphore(x2_bwd_freed, 0, 1);
-        init_semaphore(grad_l_wrt_Z1_freed, 0, 1);
-        init_semaphore(grad_L_grad_l_wrt_Z1_freed, 0, 1);
-        init_semaphore(grad_L_grad_l_wrt_Z2_freed, 0, 1);
-        init_semaphore(z1_bwd_freed, 0, 1);
-        init_semaphore(x_hat_fused_freed, 0, 1);
-        init_semaphore(grad_L_grad_x_hat_fused_freed, 0, 1);
         init_semaphore(grad_L_reconstruction_target_freed, 0, 1);
-        init_semaphore(grad_L_x_hat_fused_freed, 0, 1);
-        init_semaphore(grad_x_hat_fused_freed, 0, 1);
         init_semaphore(cs_f_store2_smem_freed, 0, 1);
 
+        // Make sure next hidden state is done loading in
         init_semaphore(w1_remat_smem_arrived, 0, 1);
         init_semaphore(b1_remat_smem_arrived, 0, 1);
         init_semaphore(w2_remat_smem_arrived, 0, 1);
         init_semaphore(b2_remat_smem_arrived, 0, 1);
 
+        // For tp reduce
         init_semaphore(bwd_dsmem_semaphore1, 0, 1);
         init_semaphore(bwd_dsmem_semaphore2, 0, 1);
 
@@ -471,10 +442,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         kittens::wait(grad_L_b1_arrived, 0);
         kittens::wait(grad_L_W2_arrived, 0);
         kittens::wait(grad_L_b2_arrived, 0);
-    }
 
-    warpgroup::zero(grad_L_ttt_norm_weight_smem);
-    warpgroup::zero(grad_L_ttt_norm_bias_smem);
+        warpgroup::zero(grad_L_ttt_norm_weight_smem);
+        warpgroup::zero(grad_L_ttt_norm_bias_smem);
+    }
 
     int semaphore_idx = 0;
     int bwd_semaphore_idx = 0;
@@ -483,10 +454,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
     {
         if (is_producer && warpid == NUM_WORKERS - 4)
         {
-            // Potentially hide this latency later
             int4 curr_checkpoint = {batch_idx, head_idx, checkpoint_idx, tp_shard_rank};
             const int sharded_checkpoint_offset = checkpoint_idx * TP + tp_shard_rank;
             const int4 W2_checkpoint = {batch_idx, head_idx, sharded_checkpoint_offset, 0};
+            
             // Load hidden states from checkpoint
             tma::expect_bytes(w1_arrived, sizeof(w1_smem));
             tma::expect_bytes(b1_arrived, sizeof(b1_smem));
@@ -510,6 +481,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         for (int mini_batch_in_group_idx = 0; mini_batch_in_group_idx < g.checkpoint_group_size; ++mini_batch_in_group_idx)
         {
             const int global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_in_group_idx;
+            // Num of mini-batches might not be perfect multiple of remat group size
             if (global_mini_batch_idx >= g.num_mini_batch) continue;
 
             if (is_producer)
@@ -619,7 +591,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 div(cs_col_fl_reg, cs_col_fl_reg, static_cast<float>(head_dim)); // var
-                add(cs_col_fl_reg, cs_col_fl_reg, 1e-6f); 
+                add(cs_col_fl_reg, cs_col_fl_reg, 1e-8f); 
                 sqrt(cs_col_fl_reg, cs_col_fl_reg); // std
                 store(ln_smem[wg_warpid], cs_col_fl_reg);
                 warpgroup::sync(warpgroupid+1);
@@ -634,12 +606,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 {
                     tma::store_async(g.x_hat_fused_group, z2_smem, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank});
                 }
-                    
 
                 tma::store_async(g.std_fused_group, ln_smem[wg_warpid], {batch_idx, head_idx, mini_batch_in_group_idx, wg_warpid});
                 tma::store_commit_group();
                 tma::store_async_wait();
-                
                 
                 // compute y
                 load(cs_row_fl_reg, ttt_norm_weight_smem);
@@ -655,8 +625,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg2, k_smem[curr_stage]);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 warpgroup::store(cs_f_store_smem, cs_cs_fl_reg);
-
-
 
                 // grad x_hat
                 load(cs_row_fl_reg, ttt_norm_weight_smem);
@@ -715,7 +683,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg, z1_smem);
                 gelu_bwd(cs_cs_fl_reg, cs_cs_fl_reg);
                 warpgroup::store(z1_smem, cs_cs_fl_reg);
-                warpgroup::sync(warpgroupid+1); // I dont think this one is necessary
+                warpgroup::sync(warpgroupid+1);
                 warpgroup::mul(grad_l_z1_smem, grad_l_z1_smem, z1_smem);
 
                 // recalc grad_l_wrt_z1 without eta for fwd comp
@@ -754,19 +722,20 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::col_sum(b1_smem, b_acc_smem, b1_smem);
 
                 warpgroup::sync(warpgroupid+1);
-                
 
                 // Compute output
-                zero(cs_cs_fl_reg);
                 kittens::wait(q_sem_arrived[curr_stage], semaphore_phase);
+                zero(cs_cs_fl_reg);
                 warpgroup::load(cs_cs_fl_reg2, w1_smem);
                 warpgroup::store(matmul_smem, cs_cs_fl_reg2);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::mm_AB(cs_cs_fl_reg, q_smem[curr_stage], matmul_smem);
-                warpgroup::mma_async_wait();
                 load(cs_row_fl_reg, b1_smem);
+                warpgroup::mma_async_wait();
+                
                 add_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
                 warpgroup::store(z1_smem, cs_cs_fl_reg);
+                warpgroup::sync(warpgroupid+1);
                 gelu(cs_cs_fl_reg, cs_cs_fl_reg);
                 warpgroup::store(x2_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
@@ -814,7 +783,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 // zero(cs_col_fl_reg);
                 row_sum(cs_col_fl_reg, cs_cs_fl_reg);
                 div(cs_col_fl_reg, cs_col_fl_reg, static_cast<float>(head_dim)); // var
-                add(cs_col_fl_reg, cs_col_fl_reg, 1e-6f); 
+                add(cs_col_fl_reg, cs_col_fl_reg, 1e-8f); 
                 sqrt(cs_col_fl_reg, cs_col_fl_reg); // std
                 store(ln_smem[wg_warpid], cs_col_fl_reg);
 
@@ -839,11 +808,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
             ++semaphore_idx;
         }
 
-
-
-        // At this point, hidden states should be the last in the checkpoint group
-
-        // Need to synchronize in order to reuse shared memory and not overstep
+        // Need to synchronize in order to reuse shared memory and not overstep.
+        // At this point, hidden states should be the last in the checkpoint group.
         if (is_producer && warpid == NUM_WORKERS - 4)
         {
             const int checkpoint_phase = (g.num_checkpoints - checkpoint_idx - 1) % 2;
@@ -858,6 +824,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
         for (int mini_batch_in_group_idx = g.checkpoint_group_size - 1; mini_batch_in_group_idx >= 0; --mini_batch_in_group_idx)
         {
             const int global_mini_batch_idx = checkpoint_idx * checkpoint_group_size + mini_batch_in_group_idx;
+            // Num of mini-batches might not be perfect multiple of remat group size
             if (global_mini_batch_idx >= g.num_mini_batch) continue;
 
             if (is_producer)
@@ -917,9 +884,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::expect_bytes(z1_bwd_arrived, sizeof(z1_bwd_smem));
                     tma::load_async(z1_bwd_smem, g.Z1_group, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank}, z1_bwd_arrived);
 
-
-                    kittens::wait(old_weights_done, bwd_semaphore_phase);
                     // load in new weights
+                    kittens::wait(old_weights_done, bwd_semaphore_phase);
                     tma::expect_bytes(w1_remat_smem_arrived, sizeof(w1_smem));
                     tma::load_async(w1_smem, g.W1_init_group, {batch_idx, head_idx, mini_batch_in_group_idx, tp_shard_rank}, w1_remat_smem_arrived);
                     tma::expect_bytes(b1_remat_smem_arrived, sizeof(b1_smem));
@@ -946,13 +912,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::expect_bytes(grad_x_hat_fused_arrived, sizeof(grad_x_hat_fused_smem));
                     tma::load_async(grad_x_hat_fused_smem, g.grad_x_hat_fused_group, {batch_idx, head_idx, mini_batch_in_group_idx, 0}, grad_x_hat_fused_arrived);
                 }
-
-                
-        
             }
             else // consumer
             {
-                
+                // Try to reuse same registers for better tracking of register usage
                 rt_fl<16, K::F> cs_cs_fl_reg;
                 rt_fl<16, K::F> cs_cs_fl_reg2;
                 typeof(cs_cs_fl_reg)::row_vec cs_row_fl_reg;
@@ -960,7 +923,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 typeof(cs_cs_fl_reg)::col_vec cs_col_fl_reg2;
 
                 const int bwd_semaphore_phase = bwd_semaphore_idx % 2;
-
                 
                 kittens::wait(grad_L_XQW_mini_batch_sem_arrived, bwd_semaphore_phase);
                 kittens::wait(x_hat_ln_arrived, bwd_semaphore_phase);
@@ -988,7 +950,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg2, x_hat_ln_smem);
                 mul_row(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg); // 3rd line, not negative
 
-                ////////// FREEEE X_HAT_LN
                 if (warpgroup::laneid() == 0) arrive(x_hat_ln_freed, 1);
 
                 zero(cs_col_fl_reg);
@@ -1014,7 +975,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 kittens::wait(z1_bar_group_arrived, bwd_semaphore_phase);
                 warpgroup::load(cs_cs_fl_reg2, z1_bar_smem);
-                ////////// FREEEE Z1_BAR
                 if (warpgroup::laneid() == 0) arrive(z1_bar_freed, 1);
                 warpgroup::mma_async_wait();
                 gelu_bwd(cs_cs_fl_reg2, cs_cs_fl_reg2);
@@ -1030,14 +990,10 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::mma_AtB(cs_cs_fl_reg2, bwd_q_smem, grad_L_Z1_bar_smem);
                 warpgroup::mma_async_wait();
 
-                ///////////// FREE BWD_Q_SMEM
-                if (warpgroup::laneid() == 0) arrive(bwd_q_sem_freed, 1);
-
                 // grad_L_b1_last
                 warpgroup::store(b_acc_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::col_sum(grad_L_b1_smem, b_acc_smem, grad_L_b1_smem);
-
 
                 warpgroup::store(grad_L_W1_smem, cs_cs_fl_reg2);
                 warpgroup::store(cs_f_store_smem, cs_cs_fl_reg2);
@@ -1050,20 +1006,15 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::mma_AtB(cs_cs_fl_reg2, x2_bar_smem, grad_L_Z2_bar_smem);
                 warpgroup::mma_async_wait();
 
-                /////// FREE X2_BAR
-                if (warpgroup::laneid() == 0) arrive(x2_bar_freed, 1);
-
                 // grad_L_b2_last
                 warpgroup::load(cs_cs_fl_reg, grad_L_Z2_bar_smem);
                 warpgroup::store(b_acc_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::col_sum(grad_L_b2_smem, b_acc_smem, grad_L_b2_smem);
-                
 
                 warpgroup::store(grad_L_W2_smem, cs_cs_fl_reg2);
                 warpgroup::sync(warpgroupid+1);
 
-                /////// FREE GRAD_L_Z2_BAR
                 if (warpgroup::laneid() == 0) arrive(grad_L_Z2_bar_freed, 1);
 
                 // grad_L_XQ_mini_batch
@@ -1075,7 +1026,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 if (tp_shard_rank == 0)
                 {
-                    warpgroup::load(cs_cs_fl_reg, grad_L_XQW_mini_batch_smem); //////////////// FREE GRAD_L_XQW_MINI_BATCH
+                    warpgroup::load(cs_cs_fl_reg, grad_L_XQW_mini_batch_smem);
                 }
                 else
                 {
@@ -1086,8 +1037,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 warpgroup::mma_ABt(cs_cs_fl_reg, grad_L_Z1_bar_smem, matmul_smem);
                 warpgroup::mma_async_wait();
-
-                //////// FREE GRAD_L_Z1_BAR
 
                 warpgroup::store(cs_f_store2_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
@@ -1153,7 +1102,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_commit_group();
                 }
 
-
                 // grad_L_grad_l_wrt_Z1
                 warpgroup::mul_row(cs_f_store_smem, bwd_k_smem, bwd_last_eta_smem); 
                 warpgroup::load(cs_cs_fl_reg, grad_L_W1_smem);
@@ -1211,8 +1159,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
 
                 tp_reduce(grad_L_grad_l_wrt_Z2_smem, reduction_buffer, bwd_dsmem_semaphore1, bwd_dsmem_semaphore2, bwd_semaphore_idx);
 
-                
-
                 // grad_L_XK_mini_batch
                 zero(cs_cs_fl_reg);
                 warpgroup::load(cs_cs_fl_reg2, grad_L_W1_smem);
@@ -1225,8 +1171,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 mul(cs_cs_fl_reg, cs_cs_fl_reg, -1.0f);
                 warpgroup::store(cs_f_store_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
-
-                ///// FREE GRAD_L_WRT_Z1
 
                 if (wg_warpid == 0)
                 {
@@ -1257,7 +1201,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::store(grad_L_grad_x_hat_fused_smem, cs_cs_fl_reg);
                 warpgroup::sync(warpgroupid+1);
 
-
                 // grad_L_reconstruction_target
                 load(cs_row_fl_reg, ttt_norm_weight_smem);
                 mul_col(cs_cs_fl_reg, cs_cs_fl_reg, cs_row_fl_reg);
@@ -1275,14 +1218,12 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 }
                 tma::store_async_wait();
 
-                
                 warpgroup::sync(warpgroupid+1);
                 // grad_L_y already calculated above
                 // grad_L_x_hat_fused
                 mul_col(cs_cs_fl_reg2, cs_cs_fl_reg, cs_row_fl_reg);
                 warpgroup::store(cs_f_store_smem, cs_cs_fl_reg2);
                 warpgroup::sync(warpgroupid+1);
-
 
                 // do ttt_norm_bias
                 warpgroup::store(b_acc_smem, cs_cs_fl_reg);
@@ -1321,7 +1262,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg2, grad_x_hat_fused_smem);
                 mul_row(cs_cs_fl_reg2, cs_cs_fl_reg2, cs_col_fl_reg);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
-
                 
                 warpgroup::load(cs_col_fl_reg, std_fused_smem);
                 div_row(cs_cs_fl_reg, cs_cs_fl_reg, cs_col_fl_reg);
@@ -1421,10 +1361,8 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::load(cs_cs_fl_reg2, matmul_smem);
                 add(cs_cs_fl_reg, cs_cs_fl_reg, cs_cs_fl_reg2);
                 warpgroup::store(grad_L_Z1_smem, cs_cs_fl_reg);
-
                 warpgroup::sync(warpgroupid+1);
                 
-
                 // grad_L_XK
                 kittens::wait(w1_remat_smem_arrived, bwd_semaphore_phase);
                 warpgroup::load(cs_cs_fl_reg, w1_smem);
@@ -1435,7 +1373,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::mma_async_wait();
 
                 warpgroup::store(grad_L_XK_smem, cs_cs_fl_reg);
-
                 warpgroup::sync(warpgroupid+1);
                 if (wg_warpid == 0)
                 {
@@ -1443,7 +1380,7 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                     tma::store_commit_group();
                 }
 
-                // grad_L_
+                // grad_L_W2_smem
                 warpgroup::load(cs_cs_fl_reg, grad_L_W2_smem);
                 warpgroup::mma_AtB(cs_cs_fl_reg, x2_bwd_smem, grad_L_Z2_smem);
 
@@ -1453,7 +1390,6 @@ void bwd_ttt_mlp_ker(const __grid_constant__ bwd_globals<head_dim> g) {
                 warpgroup::sync(warpgroupid+1);
                 warpgroup::col_sum(grad_L_b2_smem, b_acc_smem, grad_L_b2_smem);
                 warpgroup::sync(warpgroupid+1);
-
 
                 warpgroup::mma_async_wait();
                 warpgroup::store(grad_L_W2_smem, cs_cs_fl_reg);
@@ -1561,19 +1497,268 @@ torch::Tensor ttt_backward(
     constexpr int K = 4;
     const unsigned long B = XQ.size(0);
     const unsigned long H = XQ.size(1);
+    const unsigned long NH = XQ.size(1);
     const unsigned long T = XQ.size(2) * XQ.size(3); // seq len
     const unsigned long NC = XQ.size(2);
     const unsigned long CS = XQ.size(3);
     const unsigned long num_checkpoints = static_cast<int>(W1_checkpoints.size(2));
     
-    // Probably could have better checks over here
-    TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 5 && XQ.size(4) == F, "Invalid dims for XQ");
-    TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 5 && XK.size(4) == F, "Invalid dims for XK");
-    TORCH_CHECK(XV.device().is_cuda() && XV.is_contiguous() && XV.dim() == 5 && XV.size(4) == F, "Invalid dims for XV");
-    TORCH_CHECK(W1_checkpoints.device().is_cuda() && W1_checkpoints.is_contiguous() && W1_checkpoints.dim() == 5 && W1_checkpoints.size(0) == B && W1_checkpoints.size(1) == H && W1_checkpoints.size(2) == num_checkpoints && W1_checkpoints.size(3) == F && W1_checkpoints.size(4) == F*K, "Invalid dims for W1_checkpoints");
-    TORCH_CHECK(W2_checkpoints.device().is_cuda() && W2_checkpoints.is_contiguous() && W2_checkpoints.dim() == 5 && W2_checkpoints.size(0) == B && W2_checkpoints.size(1) == H && W2_checkpoints.size(2) == num_checkpoints && W2_checkpoints.size(3) == F*K && W2_checkpoints.size(4) == F, "Invalid dims for W2_checkpoints");
+    // Only perform the checks on the first call.
+    static bool checks_done = false;
+    if (!checks_done) {
+        TORCH_CHECK(XQ.device().is_cuda() && XQ.is_contiguous() && XQ.dim() == 5 && XQ.size(4) == F, "Encountered error with XQ, please check the shape and if it is contiguous.");
+        TORCH_CHECK(XK.device().is_cuda() && XK.is_contiguous() && XK.dim() == 5 && XK.size(4) == F, "Encountered error with XK, please check the shape and if it is contiguous.");
+        TORCH_CHECK(XV.device().is_cuda() && XV.is_contiguous() && XV.dim() == 5 && XV.size(4) == F, "Encountered error with XV, please check the shape and if it is contiguous.");
+        TORCH_CHECK(W1_checkpoints.device().is_cuda() && W1_checkpoints.is_contiguous() && W1_checkpoints.dim() == 5 && W1_checkpoints.size(0) == B && W1_checkpoints.size(1) == H && W1_checkpoints.size(2) == num_checkpoints && W1_checkpoints.size(3) == F && W1_checkpoints.size(4) == F*K, "Encountered error with W1_checkpoints, please check the shape and if it is contiguous.");
+        TORCH_CHECK(W2_checkpoints.device().is_cuda() && W2_checkpoints.is_contiguous() && W2_checkpoints.dim() == 5 && W2_checkpoints.size(0) == B && W2_checkpoints.size(1) == H && W2_checkpoints.size(2) == num_checkpoints && W2_checkpoints.size(3) == F*K && W2_checkpoints.size(4) == F, "Encountered error with W2_checkpoints, please check the shape and if it is contiguous.");
 
-    TORCH_CHECK(ttt_norm_weight.device().is_cuda() && ttt_norm_weight.is_contiguous() && ttt_norm_weight.dim() == 4 && ttt_norm_weight.size(0) == 1 && ttt_norm_weight.size(1) == H && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(3) == F, "Invalid dims for ttt_norm_weight");
+        TORCH_CHECK(ttt_norm_weight.device().is_cuda() && ttt_norm_weight.is_contiguous() && ttt_norm_weight.dim() == 4 && ttt_norm_weight.size(0) == 1 && ttt_norm_weight.size(1) == H && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(2) == 1 && ttt_norm_weight.size(3) == F, "Encountered error with ttt_norm_weight, please check the shape and if it is contiguous.");
+
+        TORCH_CHECK(last_eta.device().is_cuda() && last_eta.is_contiguous() &&
+                last_eta.dim() == 5 && last_eta.size(4) == 1,
+                "Encountered error with last_eta, please check the shape and if it is contiguous.");
+
+        // Check ttt_norm_bias: expecting a 4-D tensor with shape [1, H, 1, F]
+        TORCH_CHECK(ttt_norm_bias.device().is_cuda() && ttt_norm_bias.is_contiguous() &&
+                    ttt_norm_bias.dim() == 4 && ttt_norm_bias.size(0) == 1 &&
+                    ttt_norm_bias.size(1) == H && ttt_norm_bias.size(2) == 1 &&
+                    ttt_norm_bias.size(3) == F,
+                    "Encountered error with ttt_norm_bias, please check the shape and if it is contiguous.");
+
+        // Check b1_checkpoints: expecting a 5-D tensor with shape [B, NH, K, 1, F*4]
+        TORCH_CHECK(b1_checkpoints.device().is_cuda() && b1_checkpoints.is_contiguous() &&
+                    b1_checkpoints.dim() == 5 && b1_checkpoints.size(0) == B &&
+                    b1_checkpoints.size(1) == NH && b1_checkpoints.size(2) == num_checkpoints &&
+                    b1_checkpoints.size(3) == 1 && b1_checkpoints.size(4) == F * 4,
+                    "Encountered error with b1_checkpoints, please check the shape and if it is contiguous.");
+
+        // Check b2_checkpoints: expecting a 5-D tensor with shape [B, NH, num_checkpoints, 1, F]
+        TORCH_CHECK(b2_checkpoints.device().is_cuda() && b2_checkpoints.is_contiguous() &&
+                    b2_checkpoints.dim() == 5 && b2_checkpoints.size(0) == B &&
+                    b2_checkpoints.size(1) == NH && b2_checkpoints.size(2) == num_checkpoints &&
+                    b2_checkpoints.size(3) == 1 && b2_checkpoints.size(4) == F,
+                    "Encountered error with b2_checkpoints, please check the shape and if it is contiguous.");
+
+        // Check W1_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, F, F*4]
+        TORCH_CHECK(W1_init_group.device().is_cuda() && W1_init_group.is_contiguous() &&
+                    W1_init_group.dim() == 5 && W1_init_group.size(0) == B &&
+                    W1_init_group.size(1) == NH && W1_init_group.size(2) == checkpoint_group_size &&
+                    W1_init_group.size(3) == F && W1_init_group.size(4) == F * 4,
+                    "Encountered error with W1_init_group, please check the shape and if it is contiguous.");
+
+        // Check b1_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, 1, F*4]
+        TORCH_CHECK(b1_init_group.device().is_cuda() && b1_init_group.is_contiguous() &&
+                    b1_init_group.dim() == 5 && b1_init_group.size(0) == B &&
+                    b1_init_group.size(1) == NH && b1_init_group.size(2) == checkpoint_group_size &&
+                    b1_init_group.size(3) == 1 && b1_init_group.size(4) == F * 4,
+                    "Encountered error with b1_init_group, please check the shape and if it is contiguous.");
+
+        // Check W2_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, F*4, F]
+        TORCH_CHECK(W2_init_group.device().is_cuda() && W2_init_group.is_contiguous() &&
+                    W2_init_group.dim() == 5 && W2_init_group.size(0) == B &&
+                    W2_init_group.size(1) == NH && W2_init_group.size(2) == checkpoint_group_size &&
+                    W2_init_group.size(3) == F * 4 && W2_init_group.size(4) == F,
+                    "Encountered error with W2_init_group, please check the shape and if it is contiguous.");
+
+        // Check b2_init_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, 1, F]
+        TORCH_CHECK(b2_init_group.device().is_cuda() && b2_init_group.is_contiguous() &&
+                    b2_init_group.dim() == 5 && b2_init_group.size(0) == B &&
+                    b2_init_group.size(1) == NH && b2_init_group.size(2) == checkpoint_group_size &&
+                    b2_init_group.size(3) == 1 && b2_init_group.size(4) == F,
+                    "Encountered error with b2_init_group, please check the shape and if it is contiguous.");
+
+        // Check x_hat_ln_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(x_hat_ln_group.device().is_cuda() && x_hat_ln_group.is_contiguous() &&
+                    x_hat_ln_group.dim() == 5 && x_hat_ln_group.size(0) == B &&
+                    x_hat_ln_group.size(1) == NH && x_hat_ln_group.size(2) == checkpoint_group_size &&
+                    x_hat_ln_group.size(3) == CS && x_hat_ln_group.size(4) == F,
+                    "Encountered error with x_hat_ln_group, please check the shape and if it is contiguous.");
+
+        // Check std_ln_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, 1]
+        TORCH_CHECK(std_ln_group.device().is_cuda() && std_ln_group.is_contiguous() &&
+                    std_ln_group.dim() == 5 && std_ln_group.size(0) == B &&
+                    std_ln_group.size(1) == NH && std_ln_group.size(2) == checkpoint_group_size &&
+                    std_ln_group.size(3) == CS && std_ln_group.size(4) == 1,
+                    "Encountered error with std_ln_group, please check the shape and if it is contiguous.");
+
+        // Check X2_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(X2_group.device().is_cuda() && X2_group.is_contiguous() &&
+                    X2_group.dim() == 5 && X2_group.size(0) == B &&
+                    X2_group.size(1) == NH && X2_group.size(2) == checkpoint_group_size &&
+                    X2_group.size(3) == CS && X2_group.size(4) == F * 4,
+                    "Encountered error with X2_group, please check the shape and if it is contiguous.");
+
+        // Check Z1_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(Z1_group.device().is_cuda() && Z1_group.is_contiguous() &&
+                    Z1_group.dim() == 5 && Z1_group.size(0) == B &&
+                    Z1_group.size(1) == NH && Z1_group.size(2) == checkpoint_group_size &&
+                    Z1_group.size(3) == CS && Z1_group.size(4) == F * 4,
+                    "Encountered error with Z1_group, please check the shape and if it is contiguous.");
+
+        // Check Z1_bar_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(Z1_bar_group.device().is_cuda() && Z1_bar_group.is_contiguous() &&
+                    Z1_bar_group.dim() == 5 && Z1_bar_group.size(0) == B &&
+                    Z1_bar_group.size(1) == NH && Z1_bar_group.size(2) == checkpoint_group_size &&
+                    Z1_bar_group.size(3) == CS && Z1_bar_group.size(4) == F * 4,
+                    "Encountered error with Z1_bar_group, please check the shape and if it is contiguous.");
+
+        // Check X2_bar_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(X2_bar_group.device().is_cuda() && X2_bar_group.is_contiguous() &&
+                    X2_bar_group.dim() == 5 && X2_bar_group.size(0) == B &&
+                    X2_bar_group.size(1) == NH && X2_bar_group.size(2) == checkpoint_group_size &&
+                    X2_bar_group.size(3) == CS && X2_bar_group.size(4) == F * 4,
+                    "Encountered error with X2_bar_group, please check the shape and if it is contiguous.");
+
+        // Check grad_l_wrt_Z2_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(grad_l_wrt_Z2_group.device().is_cuda() && grad_l_wrt_Z2_group.is_contiguous() &&
+                    grad_l_wrt_Z2_group.dim() == 5 && grad_l_wrt_Z2_group.size(0) == B &&
+                    grad_l_wrt_Z2_group.size(1) == NH && grad_l_wrt_Z2_group.size(2) == checkpoint_group_size &&
+                    grad_l_wrt_Z2_group.size(3) == CS && grad_l_wrt_Z2_group.size(4) == F,
+                    "Encountered error with grad_l_wrt_Z2_group, please check the shape and if it is contiguous.");
+
+        // Check grad_l_wrt_Z1_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F*4]
+        TORCH_CHECK(grad_l_wrt_Z1_group.device().is_cuda() && grad_l_wrt_Z1_group.is_contiguous() &&
+                    grad_l_wrt_Z1_group.dim() == 5 && grad_l_wrt_Z1_group.size(0) == B &&
+                    grad_l_wrt_Z1_group.size(1) == NH && grad_l_wrt_Z1_group.size(2) == checkpoint_group_size &&
+                    grad_l_wrt_Z1_group.size(3) == CS && grad_l_wrt_Z1_group.size(4) == F * 4,
+                    "Encountered error with grad_l_wrt_Z1_group, please check the shape and if it is contiguous.");
+
+        // Check x_hat_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(x_hat_fused_group.device().is_cuda() && x_hat_fused_group.is_contiguous() &&
+                    x_hat_fused_group.dim() == 5 && x_hat_fused_group.size(0) == B &&
+                    x_hat_fused_group.size(1) == NH && x_hat_fused_group.size(2) == checkpoint_group_size &&
+                    x_hat_fused_group.size(3) == CS && x_hat_fused_group.size(4) == F,
+                    "Encountered error with x_hat_fused_group, please check the shape and if it is contiguous.");
+
+        // Check grad_x_hat_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(grad_x_hat_fused_group.device().is_cuda() && grad_x_hat_fused_group.is_contiguous() &&
+                    grad_x_hat_fused_group.dim() == 5 && grad_x_hat_fused_group.size(0) == B &&
+                    grad_x_hat_fused_group.size(1) == NH && grad_x_hat_fused_group.size(2) == checkpoint_group_size &&
+                    grad_x_hat_fused_group.size(3) == CS && grad_x_hat_fused_group.size(4) == F,
+                    "Encountered error with grad_x_hat_fused_group, please check the shape and if it is contiguous.");
+
+        // Check grad_output_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, F]
+        TORCH_CHECK(grad_output_fused_group.device().is_cuda() && grad_output_fused_group.is_contiguous() &&
+                    grad_output_fused_group.dim() == 5 && grad_output_fused_group.size(0) == B &&
+                    grad_output_fused_group.size(1) == NH && grad_output_fused_group.size(2) == checkpoint_group_size &&
+                    grad_output_fused_group.size(3) == CS && grad_output_fused_group.size(4) == F,
+                    "Encountered error with grad_output_fused_group, please check the shape and if it is contiguous.");
+
+        // Check std_fused_group: expecting a 5-D tensor with shape [B, NH, checkpoint_group_size, CS, 1]
+        TORCH_CHECK(std_fused_group.device().is_cuda() && std_fused_group.is_contiguous() &&
+                    std_fused_group.dim() == 5 && std_fused_group.size(0) == B &&
+                    std_fused_group.size(1) == NH && std_fused_group.size(2) == checkpoint_group_size &&
+                    std_fused_group.size(3) == CS && std_fused_group.size(4) == 1,
+                    "Encountered error with std_fused_group, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W1_last: expecting a 4-D tensor with shape [B, NH, F, F*4]
+        TORCH_CHECK(grad_L_W1_last.device().is_cuda() && grad_L_W1_last.is_contiguous() &&
+                    grad_L_W1_last.dim() == 4 && grad_L_W1_last.size(0) == B &&
+                    grad_L_W1_last.size(1) == NH && grad_L_W1_last.size(2) == F &&
+                    grad_L_W1_last.size(3) == F * 4,
+                    "Encountered error with grad_L_W1_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b1_last: expecting a 4-D tensor with shape [B, NH, 1, F*4]
+        TORCH_CHECK(grad_L_b1_last.device().is_cuda() && grad_L_b1_last.is_contiguous() &&
+                    grad_L_b1_last.dim() == 4 && grad_L_b1_last.size(0) == B &&
+                    grad_L_b1_last.size(1) == NH && grad_L_b1_last.size(2) == 1 &&
+                    grad_L_b1_last.size(3) == F * 4,
+                    "Encountered error with grad_L_b1_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W2_last: expecting a 4-D tensor with shape [B, NH, F*4, F]
+        TORCH_CHECK(grad_L_W2_last.device().is_cuda() && grad_L_W2_last.is_contiguous() &&
+                    grad_L_W2_last.dim() == 4 && grad_L_W2_last.size(0) == B &&
+                    grad_L_W2_last.size(1) == NH && grad_L_W2_last.size(2) == F * 4 &&
+                    grad_L_W2_last.size(3) == F,
+                    "Encountered error with grad_L_W2_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b2_last: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_b2_last.device().is_cuda() && grad_L_b2_last.is_contiguous() &&
+                    grad_L_b2_last.dim() == 4 && grad_L_b2_last.size(0) == B &&
+                    grad_L_b2_last.size(1) == NH && grad_L_b2_last.size(2) == 1 &&
+                    grad_L_b2_last.size(3) == F,
+                    "Encountered error with grad_L_b2_last, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XQW_mini_batch: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XQW_mini_batch.device().is_cuda() && grad_L_XQW_mini_batch.is_contiguous() &&
+                    grad_L_XQW_mini_batch.dim() == 5 && grad_L_XQW_mini_batch.size(0) == B &&
+                    grad_L_XQW_mini_batch.size(1) == NH && grad_L_XQW_mini_batch.size(2) == NC &&
+                    grad_L_XQW_mini_batch.size(3) == CS && grad_L_XQW_mini_batch.size(4) == F,
+                    "Encountered error with grad_L_XQW_mini_batch, please check the shape and if it is contiguous.");
+
+        // Check grad_L_ttt_norm_weight: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_ttt_norm_weight.device().is_cuda() && grad_L_ttt_norm_weight.is_contiguous() &&
+                    grad_L_ttt_norm_weight.dim() == 4 && grad_L_ttt_norm_weight.size(0) == B &&
+                    grad_L_ttt_norm_weight.size(1) == NH && grad_L_ttt_norm_weight.size(2) == 1 &&
+                    grad_L_ttt_norm_weight.size(3) == F,
+                    "Encountered error with grad_L_ttt_norm_weight, please check the shape and if it is contiguous.");
+
+        // Check grad_L_ttt_norm_bias: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_ttt_norm_bias.device().is_cuda() && grad_L_ttt_norm_bias.is_contiguous() &&
+                    grad_L_ttt_norm_bias.dim() == 4 && grad_L_ttt_norm_bias.size(0) == B &&
+                    grad_L_ttt_norm_bias.size(1) == NH && grad_L_ttt_norm_bias.size(2) == 1 &&
+                    grad_L_ttt_norm_bias.size(3) == F,
+                    "Encountered error with grad_L_ttt_norm_bias, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W1_init: expecting a 4-D tensor with shape [B, NH, F, F*4]
+        TORCH_CHECK(grad_L_W1_init.device().is_cuda() && grad_L_W1_init.is_contiguous() &&
+                    grad_L_W1_init.dim() == 4 && grad_L_W1_init.size(0) == B &&
+                    grad_L_W1_init.size(1) == NH && grad_L_W1_init.size(2) == F &&
+                    grad_L_W1_init.size(3) == F * 4,
+                    "Encountered error with grad_L_W1_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b1_init: expecting a 4-D tensor with shape [B, NH, 1, F*4]
+        TORCH_CHECK(grad_L_b1_init.device().is_cuda() && grad_L_b1_init.is_contiguous() &&
+                    grad_L_b1_init.dim() == 4 && grad_L_b1_init.size(0) == B &&
+                    grad_L_b1_init.size(1) == NH && grad_L_b1_init.size(2) == 1 &&
+                    grad_L_b1_init.size(3) == F * 4,
+                    "Encountered error with grad_L_b1_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_W2_init: expecting a 4-D tensor with shape [B, NH, F*4, F]
+        TORCH_CHECK(grad_L_W2_init.device().is_cuda() && grad_L_W2_init.is_contiguous() &&
+                    grad_L_W2_init.dim() == 4 && grad_L_W2_init.size(0) == B &&
+                    grad_L_W2_init.size(1) == NH && grad_L_W2_init.size(2) == F * 4 &&
+                    grad_L_W2_init.size(3) == F,
+                    "Encountered error with grad_L_W2_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_b2_init: expecting a 4-D tensor with shape [B, NH, 1, F]
+        TORCH_CHECK(grad_L_b2_init.device().is_cuda() && grad_L_b2_init.is_contiguous() &&
+                    grad_L_b2_init.dim() == 4 && grad_L_b2_init.size(0) == B &&
+                    grad_L_b2_init.size(1) == NH && grad_L_b2_init.size(2) == 1 &&
+                    grad_L_b2_init.size(3) == F,
+                    "Encountered error with grad_L_b2_init, please check the shape and if it is contiguous.");
+
+        // Check grad_L_last_eta: expecting a 5-D tensor with shape [B, NH, NC, CS, 1]
+        TORCH_CHECK(grad_L_last_eta.device().is_cuda() && grad_L_last_eta.is_contiguous() &&
+                    grad_L_last_eta.dim() == 5 && grad_L_last_eta.size(0) == B &&
+                    grad_L_last_eta.size(1) == NH && grad_L_last_eta.size(2) == NC &&
+                    grad_L_last_eta.size(3) == CS && grad_L_last_eta.size(4) == 1,
+                    "Encountered error with grad_L_last_eta, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XQ: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XQ.device().is_cuda() && grad_L_XQ.is_contiguous() &&
+                    grad_L_XQ.dim() == 5 && grad_L_XQ.size(0) == B &&
+                    grad_L_XQ.size(1) == NH && grad_L_XQ.size(2) == NC &&
+                    grad_L_XQ.size(3) == CS && grad_L_XQ.size(4) == F,
+                    "Encountered error with grad_L_XQ, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XK: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XK.device().is_cuda() && grad_L_XK.is_contiguous() &&
+                    grad_L_XK.dim() == 5 && grad_L_XK.size(0) == B &&
+                    grad_L_XK.size(1) == NH && grad_L_XK.size(2) == NC &&
+                    grad_L_XK.size(3) == CS && grad_L_XK.size(4) == F,
+                    "Encountered error with grad_L_XK, please check the shape and if it is contiguous.");
+
+        // Check grad_L_XV: expecting a 5-D tensor with shape [B, NH, NC, CS, F]
+        TORCH_CHECK(grad_L_XV.device().is_cuda() && grad_L_XV.is_contiguous() &&
+                    grad_L_XV.dim() == 5 && grad_L_XV.size(0) == B &&
+                    grad_L_XV.size(1) == NH && grad_L_XV.size(2) == NC &&
+                    grad_L_XV.size(3) == CS && grad_L_XV.size(4) == F,
+                    "Encountered error with grad_L_XV, please check the shape and if it is contiguous.");
+        
+        checks_done = true;
+    }
+
 
     using globals = bwd_globals<F>;
 
@@ -1707,7 +1892,6 @@ torch::Tensor ttt_backward(
 
     auto stream = at::cuda::getCurrentCUDAStream().stream(); 
 
-
     constexpr long mem_size = kittens::MAX_SHARED_MEMORY;
     cudaFuncSetAttribute(
         bwd_ttt_mlp_ker<F>,
@@ -1730,7 +1914,7 @@ torch::Tensor ttt_backward(
     }
 
     return Out;
-}//*/
+}
 
 #else
 

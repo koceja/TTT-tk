@@ -17,9 +17,6 @@ HOW TO REGISTER YOUR OWN, CUSTOM SET OF KERNELS:
 4. The macro defined here, when that kernel is compiled, will be "TK_COMPILE_{IDENTIFIER_IN_ALL_CAPS}." You need to add two chunks to this file.
 4a. the extern declaration at the top.
 4b. the registration of the function into the module.
-
-m.def("attention_inference_forward", attention_inference_forward);
-
 */
 
 
@@ -95,30 +92,8 @@ extern torch::Tensor ttt_backward(
 #endif
 
 
-
-#ifdef TK_COMPILE_ATTN
-extern std::vector<torch::Tensor> attention_forward(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, bool causal
-); 
-extern std::vector<torch::Tensor> attention_backward(
-    torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor o, 
-    torch::Tensor l_vec, torch::Tensor og, 
-    bool causal
-);
-#endif
-
-#ifdef TK_COMPILE_FUSED_LAYERNORM
-extern std::tuple<torch::Tensor, torch::Tensor> fused_layernorm(
-    const torch::Tensor x,
-    const torch::Tensor residual,
-    const torch::Tensor norm_weight,
-    const torch::Tensor norm_bias,
-    float dropout_p
-);
-#endif
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "ThunderKittens Kernels"; // optional module docstring
+    m.doc() = "Test Time Training Kernels"; // optional module docstring
 
 #ifdef TK_COMPILE_TTT
     m.def("ttt_forward", &ttt_forward, "TTT Forward.");
@@ -127,14 +102,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #ifdef TK_COMPILE_TTT_BACKWARD
     m.def("ttt_backward", &ttt_backward, "TTT Backward.");
 #endif
-
-#ifdef TK_COMPILE_ATTN
-    m.def("mha_forward",  torch::wrap_pybind_function(attention_forward), "Bidirectional forward MHA. Takes Q,K,V,O in (B,H,N,D) where D must be 64 or 128, and N must be a multiple of 64. Additionally writes out norm vector L of shape (B,H,N), used in backward pass.");
-    m.def("mha_backward", torch::wrap_pybind_function(attention_backward), "Bidirectional backward MHA. Takes Q,K,V,O,Og,Qg,Kg,Vg in (B,H,N,D) where D must be 64 or 128, and N must be a multiple of 64. Additionally requres norm vec l_vec, and (TODO) d_vec memory.");
-#endif
-
-#ifdef TK_COMPILE_FUSED_LAYERNORM
-    m.def("fused_layernorm", fused_layernorm, "LayerNorm TK. Takes tensors (x, residual, norm_weight, norm_bias, dropout_p). x, residual, norm_weight, norm_bias are bf16. dropout_p is float. Returns (B, H, N, 128) in bf16.");
-#endif
-
 }

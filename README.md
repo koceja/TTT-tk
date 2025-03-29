@@ -2,6 +2,19 @@
 
 TTT is a repository for test-time training kernels.
 
+## Installation
+
+Installation requires CUDA drivers and toolkit (v 12.3+) and gcc 11+.
+
+### From source
+```bash
+python setup.py install
+```
+
+We recommend you use conda to install your environment.
+
+## Usage
+
 Currently, we only support non-causal TTT-MLP kernels with head dimension of 64. Remat is automatically supported with these kernels.
 
 Here is an example on how to invoke the kernels.
@@ -89,21 +102,6 @@ This repository is forked from Thunderkittens (https://github.com/HazyResearch/T
 Thunderkittens was used and modified for kernel development.
 
 
-## Installation
-
-Installation requires CUDA drivers or toolkit (v 12.3+) and g++ v10+
-
-### Pip
-```bash
-pip install test_time_training
-```
-
-### From source
-```bash
-source env.src
-python setup.py install
-```
-
 ## Notes on implementation
 
 These kernels use distributed shared memory to implement tensor-parallelism and sharding. The hidden states are sharded across SMs to save shared memory. 
@@ -111,3 +109,5 @@ These kernels use distributed shared memory to implement tensor-parallelism and 
 These kernels also use input staging and pipelining to hide latencies for global reads.
 
 We also used mixed precision to perform the matmuls in bf16 for tensor core usage and also kept hidden state (and grads) accumulation and layer norm computation in float32.
+
+Kernel code can be found in `./kernels/`.
